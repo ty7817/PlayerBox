@@ -8,23 +8,35 @@ import AVFoundation
 
 enum OrientationSupport {
     static var mask: UIInterfaceOrientationMask = .allButUpsideDown
+    private static var lastRequest: TimeInterval = 0
+
+    static var scene: UIWindowScene? {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        return scenes.first { $0.activationState == .foregroundActive } ?? scenes.first
+    }
 
     static var isLandscape: Bool {
-        guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene else { return false }
-        return scene.interfaceOrientation.isLandscape
+        guard let scene = scene else { return false }
+        return scene.effectiveGeometry.interfaceOrientation.isLandscape
     }
 
     static func toggle() {
-        guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene else { return }
-        let wanted: UIInterfaceOrientationMask = scene.interfaceOrientation.isLandscape ? .portrait : .landscape
+        let now = Date().timeIntervalSince1970
+        guard now - lastRequest > 0.45 else { return }
+        lastRequest = now
+        apply(isLandscape ? .portrait : .landscape)
+    }
+
+    static func apply(_ wanted: UIInterfaceOrientationMask) {
         mask = wanted
-        scene.requestGeometryUpdate(.iOS(interfaceOrientations: wanted))
+        guard let scene = scene else { return }
+        scene.keyWindow?.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
+        scene.requestGeometryUpdate(.iOS(interfaceOrientations: wanted)) { _ in }
     }
 
     static func lockPortrait() {
-        mask = .portrait
-        guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene else { return }
-        scene.requestGeometryUpdate(.iOS(interfaceOrientations: .portrait))
+        guard isLandscape else { return }
+        apply(.portrait)
     }
 
     static func unlock() {
@@ -75,7 +87,7 @@ final class VolumeControl {
     }
 }
 
-// MARK: - 手势 HUD
+// MARK: - 手势状态
 
 enum DragMode {
     case none
