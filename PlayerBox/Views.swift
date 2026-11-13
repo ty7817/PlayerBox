@@ -340,29 +340,14 @@ struct DownloadsView: View {
                                            description: Text("在链接页左滑选「下载」"))
                 }
                 ForEach(center.items) { item in
-                    VStack(alignment: .leading, spacing: 6) {
-                        HStack {
-                            Text(item.title).font(.subheadline.weight(.medium)).lineLimit(1)
-                            Spacer()
-                            Text(item.statusText)
-                                .font(.caption2)
-                                .foregroundStyle(item.isFailed ? Color.red : Color.secondary)
+                    DownloadRow(item: item)
+                        .swipeActions(edge: .trailing) {
+                            if !item.isFinished && !item.isFailed {
+                                Button(role: .destructive) {
+                                    center.cancel(item)
+                                } label: { Label("取消", systemImage: "xmark") }
+                            }
                         }
-                        if !item.isFinished && !item.isFailed {
-                            ProgressView(value: item.progress)
-                        }
-                        if !item.detail.isEmpty {
-                            Text(item.detail).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
-                        }
-                    }
-                    .padding(.vertical, 4)
-                    .swipeActions(edge: .trailing) {
-                        if !item.isFinished && !item.isFailed {
-                            Button(role: .destructive) {
-                                center.cancel(item)
-                            } label: { Label("取消", systemImage: "xmark") }
-                        }
-                    }
                 }
             }
             .navigationTitle("下载")
@@ -373,6 +358,29 @@ struct DownloadsView: View {
                 }
             }
         }
+    }
+}
+
+struct DownloadRow: View {
+    @ObservedObject var item: DownloadItem
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(item.title).font(.subheadline.weight(.medium)).lineLimit(1)
+                Spacer()
+                Text(item.statusText)
+                    .font(.caption2)
+                    .foregroundStyle(item.isFailed ? Color.red : Color.secondary)
+            }
+            if !item.isFinished && !item.isFailed {
+                ProgressView(value: item.progress)
+            }
+            if !item.detail.isEmpty {
+                Text(item.detail).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+            }
+        }
+        .padding(.vertical, 4)
     }
 }
 
@@ -388,7 +396,7 @@ struct FilesView: View {
                 let files = store.files()
                 if files.isEmpty {
                     ContentUnavailableView("暂无文件", systemImage: "folder",
-                                           description: Text("下载完成的视频会出现在这里；也会同步到「文件」App"))
+                                           description: Text("下载完成的视频会出现在这里，也会同步到「文件」App"))
                 }
                 ForEach(files) { file in
                     Button {
