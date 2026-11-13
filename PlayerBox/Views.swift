@@ -14,6 +14,11 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
             DownloadCenter.shared.backgroundCompletion = completionHandler
         }
     }
+
+    func application(_ application: UIApplication,
+                     supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
+        OrientationSupport.mask
+    }
 }
 
 @main
@@ -297,6 +302,14 @@ struct PlayerScreen: View {
     @State private var timeObserver: Any? = nil
     @State private var cancellable: AnyCancellable? = nil
 
+    @State private var controlsVisible = true
+    @State private var hud: PlayerHUD? = nil
+    @State private var dragMode: DragMode = .none
+    @State private var dragStartSeconds: Double = 0
+    @State private var dragStartValue: Float = 0
+    @State private var dragSeekTarget: Double = 0
+    @State private var hudTask: Task<Void, Never>? = nil
+
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
@@ -317,13 +330,18 @@ struct PlayerScreen: View {
                 }
             }
 
-            VStack(spacing: 0) {
-                topBar
-                Spacer()
-                if !errorText.isEmpty { errorBanner }
-                bottomBar
+            hudView
+
+            if controlsVisible {
+                VStack(spacing: 0) {
+                    topBar
+                    Spacer()
+                    if !errorText.isEmpty { errorBanner }
+                    bottomBar
+                }
+                .padding(.top, 6)
+                .transition(.opacity)
             }
-            .padding(.top, 6)
 
             if !toast.isEmpty {
                 Text(toast)
@@ -344,41 +362,141 @@ struct PlayerScreen: View {
         }
     }
 
-    // MARK: 画面
+    // MARK: 画面与手势
 
     private var videoArea: some View {
-        Group {
-            if useWeb {
-                WebView(urlString: target.remote?.absoluteString ?? "")
-            } else if useVLC {
-                VLCVideoSurface(player: vlc.player)
-            } else if let player = player {
-                PlayerLayerView(player: player)
-            } else {
-                Color.black
+        GeometryReader { geo in
+            Group {
+                if useWeb {
+                    WebView(urlString: target.remote?.absoluteString ?? "")
+                } else if useVLC {
+                    VLCVideoSurface(player: vlc.player)
+                } else if let player = player {
+                    PlayerLayerView(player: player)
+                } else {
+                    Color.black
+                }
             }
+            .frame(width: geo.size.width, height: geo.size.height)
+            .contentShape(Rectangle())
+            .simultaneousGesture(tapGesture)
+            .gesture(
+                DragGesture(minimumDistance: 14)
+                    .onChanged { value in handleDragChanged(value, size: geo.size) }
+                    .onEnded { value in handleDragEnded(value) }
+            )
         }
         .ignoresSafeArea()
-        .contentShape(Rectangle())
-        .onTapGesture(count: 2) {
+    }
+
+    private var tapGesture: some Gesture {
+        TapGesture(count: 2).onEnded {
             if settings.value.doubleTapToggle { togglePlayback() }
         }
-        .gesture(
-            DragGesture(minimumDistance: 40).onEnded { value in
+        .exclusively(before: TapGesture(count: 1).onEnded {
+            guard settings.value.singleTapToggle else { return }
+            withAnimation(.easeInOut(duration: 0.22)) { controlsVisible.toggle() }
+        })
+    }
+
+    private func handleDragChanged(_ value: DragGesture.Value, size: CGSize) {
+        if dragMode == .none {
+            let dx = value.translation.width
+            let dy = value.translation.height
+            guard max(abs(dx), abs(dy)) > 16 else { return }
+
+            if abs(dx) > abs(dy) {
                 guard settings.value.swipeSeek else { return }
-                let dx = value.translation.width
-                let dy = value.translation.height
-                guard abs(dx) > abs(dy), abs(dx) > 60 else { return }
-                jump(dx > 0 ? 15 : -15)
-                flash(dx > 0 ? "快进 15 秒" : "快退 15 秒")
+                dragMode = .seek
+                dragStartSeconds = displayCurrent
+                dragSeekTarget = displayCurrent
+            } else if value.startLocation.x <= size.width / 2 {
+                guard settings.value.brightnessSwipe else { return }
+                dragMode = .brightness
+                dragStartValue = Float(UIScreen.main.brightness)
+            } else {
+                guard settings.value.volumeSwipe else { return }
+                dragMode = .volume
+                dragStartValue = VolumeControl.shared.current()
             }
-        )
+        }
+
+        switch dragMode {
+        case .seek:
+            let fullRange: Double = 90
+            let delta = Double(value.translation.width / max(size.width, 1)) * fullRange
+            let maxTime = displayDuration > 0 ? displayDuration : max(dragStartSeconds + 3600, 1)
+            dragSeekTarget = min(max(dragStartSeconds + delta, 0), maxTime)
+            hud = PlayerHUD(
+                icon: delta >= 0 ? "goforward" : "gobackward",
+                title: (delta >= 0 ? "快进 " : "快退 ") + "\(Int(abs(delta)))s",
+                detail: "\(timeText(dragSeekTarget)) / \(timeText(displayDuration))",
+                progress: displayDuration > 0 ? dragSeekTarget / displayDuration : -1
+            )
+
+        case .brightness:
+            let level = min(max(dragStartValue + Float(-value.translation.height / max(size.height, 1)), 0), 1)
+            UIScreen.main.brightness = CGFloat(level)
+            hud = PlayerHUD(icon: "sun.max.fill",
+                            title: "亮度 \(Int(level * 100))%",
+                            detail: "上滑增加 · 下滑减少",
+                            progress: Double(level))
+
+        case .volume:
+            let level = min(max(dragStartValue + Float(-value.translation.height / max(size.height, 1)), 0), 1)
+            VolumeControl.shared.set(level)
+            hud = PlayerHUD(icon: level <= 0.01 ? "speaker.slash.fill" : "speaker.wave.2.fill",
+                            title: "音量 \(Int(level * 100))%",
+                            detail: "上滑增加 · 下滑减少",
+                            progress: Double(level))
+
+        case .none:
+            break
+        }
+    }
+
+    private func handleDragEnded(_ value: DragGesture.Value) {
+        if dragMode == .seek {
+            seek(dragSeekTarget)
+        }
+        dragMode = .none
+        hudTask?.cancel()
+        hudTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 900_000_000)
+            if !Task.isCancelled {
+                withAnimation(.easeOut(duration: 0.2)) { hud = nil }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var hudView: some View {
+        if let hud = hud {
+            VStack(spacing: 8) {
+                Image(systemName: hud.icon).font(.system(size: 24))
+                Text(hud.title).font(.system(size: 15, weight: .semibold))
+                if !hud.detail.isEmpty {
+                    Text(hud.detail).font(.system(size: 11)).foregroundStyle(.white.opacity(0.75))
+                }
+                if hud.progress >= 0 {
+                    ProgressView(value: min(max(hud.progress, 0), 1))
+                        .progressViewStyle(.linear)
+                        .tint(.white)
+                        .frame(width: 150)
+                }
+            }
+            .foregroundStyle(.white)
+            .padding(.horizontal, 22)
+            .padding(.vertical, 16)
+            .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 14))
+            .transition(.opacity)
+        }
     }
 
     // MARK: 顶部
 
     private var topBar: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 10) {
             Button { closePlayer() } label: {
                 Image(systemName: "xmark")
                     .font(.system(size: 17, weight: .semibold))
@@ -393,16 +511,16 @@ struct PlayerScreen: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
 
-            Spacer(minLength: 8)
+            Spacer(minLength: 6)
+
+            Button { OrientationSupport.toggle() } label: {
+                topIcon("arrow.triangle.2.circlepath")
+            }
 
             if let file = target.direct {
-                ShareLink(item: file) {
-                    topIcon("square.and.arrow.up")
-                }
+                ShareLink(item: file) { topIcon("square.and.arrow.up") }
             } else if let remote = target.remote {
-                ShareLink(item: remote) {
-                    topIcon("square.and.arrow.up")
-                }
+                ShareLink(item: remote) { topIcon("square.and.arrow.up") }
             }
 
             Menu {
@@ -606,6 +724,7 @@ struct PlayerScreen: View {
     private func prepare() {
         speed = Float(settings.value.defaultSpeed)
         isLooping = settings.value.loopPlayback
+        VolumeControl.shared.attach()
         activateAudioSession()
 
         if settings.value.keepAwake {
@@ -681,6 +800,7 @@ struct PlayerScreen: View {
         player?.pause()
         player = nil
         vlc.pause()
+        hudTask?.cancel()
         UIApplication.shared.isIdleTimerDisabled = false
     }
 
@@ -771,9 +891,9 @@ struct PlayerScreen: View {
                 return
             }
             let name = "shot-\(Int(Date().timeIntervalSince1970)).jpg"
-            let url = Store.mediaDir.appendingPathComponent(name)
+            let dest = Store.mediaDir.appendingPathComponent(name)
             do {
-                try data.write(to: url, options: .atomic)
+                try data.write(to: dest, options: .atomic)
                 flash("截图已保存到「本地文件」")
             } catch {
                 flash("截图保存失败")
