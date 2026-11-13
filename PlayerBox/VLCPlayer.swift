@@ -77,7 +77,7 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         let ms = Double(player.time.intValue)
         currentSeconds = max(0, ms / 1000)
         currentText = format(Int(player.time.intValue))
-        let length = Double(player.media.length.intValue)
+        let length = Double(player.media?.length.intValue ?? 0)
         if length > 0 { durationSeconds = length / 1000 }
     }
 
