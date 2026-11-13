@@ -47,6 +47,7 @@ struct RootView: View {
 
 struct LinksView: View {
     @ObservedObject var store: Store
+    @ObservedObject private var thumbs = ThumbnailCenter.shared
     @State private var showAdd = false
     @State private var playing: PlayTarget? = nil
     @State private var toast = ""
@@ -88,6 +89,9 @@ struct LinksView: View {
                     Button { showAdd = true } label: { Image(systemName: "plus") }
                 }
             }
+            .task(id: store.state.links.count) {
+                thumbs.ensureRemote(store.state.links)
+            }
             .sheet(isPresented: $showAdd) { AddLinkView(store: store) }
             .fullScreenCover(item: $playing) { target in
                 PlayerScreen(target: target)
@@ -103,9 +107,7 @@ struct LinksView: View {
 
     private func row(_ link: MediaLink) -> some View {
         HStack(spacing: 12) {
-            Image(systemName: link.kind.icon)
-                .frame(width: 26)
-                .foregroundStyle(Color(red: 0, green: 0.52, blue: 0.6))
+            thumb(for: link)
             VStack(alignment: .leading, spacing: 3) {
                 Text(link.title).font(.subheadline.weight(.medium)).foregroundStyle(.primary).lineLimit(1)
                 Text(link.url).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
@@ -127,6 +129,27 @@ struct LinksView: View {
                 .foregroundStyle(Color(red: 0, green: 0.52, blue: 0.6))
         }
         .padding(.vertical, 4)
+    }
+
+    @ViewBuilder
+    private func thumb(for link: MediaLink) -> some View {
+        let key = ThumbnailStore.key(forRemote: link.url)
+        if let image = thumbs.image(key: key) {
+            Image(uiImage: image)
+                .resizable()
+                .aspectRatio(contentMode: .fill)
+                .frame(width: 64, height: 40)
+                .clipShape(RoundedRectangle(cornerRadius: 7))
+        } else {
+            RoundedRectangle(cornerRadius: 7)
+                .fill(Color(.tertiarySystemFill))
+                .frame(width: 64, height: 40)
+                .overlay(
+                    Image(systemName: link.kind.icon)
+                        .font(.footnote)
+                        .foregroundStyle(Color(red: 0, green: 0.52, blue: 0.6))
+                )
+        }
     }
 
     private func download(_ link: MediaLink) {
@@ -203,73 +226,169 @@ struct PlayTarget: Identifiable {
 struct PlayerScreen: View {
     let target: PlayTarget
     @Environment(\.dismiss) private var dismiss
+
     @State private var player: AVPlayer? = nil
     @State private var useWeb = false
     @State private var errorText = ""
+    @State private var isReady = false
+    @State private var speed: Float = 1
+    @State private var isMuted = false
+    @State private var isLooping = false
+    @State private var showShare = false
+    @State private var toast = ""
     @State private var cancellable: AnyCancellable? = nil
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
+            content
+            overlay
+        }
+        .onAppear { prepare() }
+        .onDisappear { player?.pause() }
+        .onReceive(NotificationCenter.default.publisher(for: .AVPlayerItemDidPlayToEndTime)) { _ in
+            guard isLooping, let player = player else { return }
+            player.seek(to: .zero)
+            player.play()
+        }
+        .sheet(isPresented: $showShare) {
+            ShareSheet(items: shareItems)
+        }
+    }
 
-            if useWeb {
-                WebView(urlString: target.remote?.absoluteString ?? "")
-                    .ignoresSafeArea()
-            } else if let player = player {
-                VideoPlayer(player: player)
-                    .ignoresSafeArea()
-            } else {
-                ProgressView().tint(.white)
-            }
+    @ViewBuilder
+    private var content: some View {
+        if useWeb {
+            WebView(urlString: target.remote?.absoluteString ?? "")
+                .ignoresSafeArea()
+        } else if let player = player {
+            VideoPlayer(player: player)
+                .ignoresSafeArea()
+        } else {
+            ProgressView()
+                .tint(.white)
+                .scaleEffect(1.3)
+        }
+    }
 
-            VStack {
-                HStack(spacing: 10) {
-                    Button {
-                        player?.pause()
-                        dismiss()
-                    } label: {
-                        Image(systemName: "xmark")
+    private var overlay: some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 10) {
+                Button {
+                    player?.pause()
+                    dismiss()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 15, weight: .bold))
+                        .padding(10)
+                        .background(.ultraThinMaterial, in: Circle())
+                }
+                Spacer()
+                if let file = target.direct {
+                    ShareLink(item: file) {
+                        Image(systemName: "square.and.arrow.up")
                             .font(.system(size: 15, weight: .bold))
                             .padding(10)
                             .background(.ultraThinMaterial, in: Circle())
                     }
-                    Spacer()
-                    if let file = target.direct {
-                        ShareLink(item: file) {
-                            Image(systemName: "square.and.arrow.up")
-                                .font(.system(size: 15, weight: .bold))
-                                .padding(10)
-                                .background(.ultraThinMaterial, in: Circle())
-                        }
-                    }
-                    if !errorText.isEmpty && !useWeb {
-                        Button("用网页播") {
-                            player?.pause()
-                            useWeb = true
-                            errorText = ""
-                        }
-                        .font(.caption)
-                        .padding(.horizontal, 12).padding(.vertical, 8)
-                        .background(.ultraThinMaterial, in: Capsule())
-                    }
                 }
-                .padding(.horizontal, 16)
-                .padding(.top, 8)
+                if !errorText.isEmpty && !useWeb {
+                    Button("用网页播") {
+                        player?.pause()
+                        useWeb = true
+                        errorText = ""
+                    }
+                    .font(.caption)
+                    .padding(.horizontal, 12).padding(.vertical, 8)
+                    .background(.ultraThinMaterial, in: Capsule())
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 8)
 
-                if !errorText.isEmpty {
-                    Text(errorText)
-                        .font(.caption)
-                        .foregroundStyle(.white)
-                        .multilineTextAlignment(.leading)
-                        .padding(10)
-                        .background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 10))
-                        .padding(.horizontal, 16)
-                }
-                Spacer()
+            if !isReady && player != nil && !useWeb {
+                Text("缓冲中…")
+                    .font(.caption)
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 12).padding(.vertical, 6)
+                    .background(.black.opacity(0.45), in: Capsule())
+            }
+
+            if !errorText.isEmpty {
+                Text(errorText)
+                    .font(.caption)
+                    .foregroundStyle(.white)
+                    .multilineTextAlignment(.leading)
+                    .padding(10)
+                    .background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 10))
+                    .padding(.horizontal, 16)
+            }
+
+            Spacer()
+
+            if player != nil && !useWeb {
+                actionBar
+            }
+
+            if !toast.isEmpty {
+                Text(toast)
+                    .font(.caption)
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 12).padding(.vertical, 6)
+                    .background(.black.opacity(0.6), in: Capsule())
+                    .padding(.bottom, 8)
             }
         }
-        .onAppear { prepare() }
-        .onDisappear { player?.pause() }
+    }
+
+    private var actionBar: some View {
+        HStack(spacing: 12) {
+            Menu {
+                ForEach([0.5, 0.75, 1.0, 1.25, 1.5, 2.0], id: \.self) { value in
+                    Button {
+                        setSpeed(Float(value))
+                    } label: {
+                        Text(speedText(Float(value)))
+                    }
+                }
+            } label: {
+                pill(speedText(speed), icon: "speedometer")
+            }
+
+            Button { jump(-15) } label: { pill("-15s", icon: "gobackward.15") }
+            Button { jump(15) } label: { pill("+15s", icon: "goforward.15") }
+            Button { toggleMute() } label: {
+                pill(isMuted ? "静音" : "有声", icon: isMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
+            }
+
+            Menu {
+                Toggle("循环播放", isOn: $isLooping)
+                Button("复制链接") { copyLink() }
+                Button("分享 / 用外部播放器打开") { showShare = true }
+            } label: {
+                pill("更多", icon: "ellipsis")
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+        .background(.ultraThinMaterial, in: Capsule())
+        .padding(.bottom, 18)
+    }
+
+    private func pill(_ text: String, icon: String) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: icon).font(.system(size: 12, weight: .semibold))
+            Text(text).font(.system(size: 12, weight: .semibold))
+        }
+        .padding(.horizontal, 8).padding(.vertical, 6)
+        .foregroundStyle(.white)
+        .background(Color.white.opacity(0.12), in: Capsule())
+    }
+
+    private var shareItems: [Any] {
+        if let file = target.direct { return [file] }
+        if let remote = target.remote { return [remote] }
+        return []
     }
 
     private func prepare() {
@@ -287,22 +406,70 @@ struct PlayerScreen: View {
 
         let ext = url.pathExtension.lowercased()
         if target.kind == .file, !ext.isEmpty, !LinkDetector.nativePlayable(ext) {
-            errorText = "内置播放器不支持 .\(ext)。点右上角分享按钮，可用 VLC / nPlayer / Infuse 打开"
+            errorText = "内置播放器不支持 .\(ext)。点「更多 → 分享」可用 VLC / nPlayer / Infuse 打开"
             return
         }
 
         let item = AVPlayerItem(url: url)
+        item.preferredForwardBufferDuration = 2
         let newPlayer = AVPlayer(playerItem: item)
+        newPlayer.automaticallyWaitsToMinimizeStalling = true
+        newPlayer.defaultRate = speed
         player = newPlayer
         newPlayer.play()
 
         cancellable = item.publisher(for: \.status)
             .receive(on: DispatchQueue.main)
             .sink { status in
-                if status == .failed {
+                switch status {
+                case .readyToPlay:
+                    isReady = true
+                case .failed:
                     errorText = item.error?.localizedDescription ?? "播放失败：可能是格式不受支持或链接已失效"
+                default:
+                    break
                 }
             }
+    }
+
+    private func setSpeed(_ value: Float) {
+        speed = value
+        guard let player = player else { return }
+        player.defaultRate = value
+        if player.timeControlStatus == .playing {
+            player.rate = value
+        }
+    }
+
+    private func jump(_ seconds: Double) {
+        guard let player = player else { return }
+        var target = CMTimeAdd(player.currentTime(), CMTime(seconds: seconds, preferredTimescale: 600))
+        if CMTimeCompare(target, .zero) < 0 { target = .zero }
+        player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
+    }
+
+    private func toggleMute() {
+        isMuted.toggle()
+        player?.isMuted = isMuted
+    }
+
+    private func copyLink() {
+        let text = target.remote?.absoluteString ?? target.direct?.path ?? ""
+        UIPasteboard.general.string = text
+        flash("链接已复制")
+    }
+
+    private func flash(_ text: String) {
+        toast = text
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_600_000_000)
+            if toast == text { toast = "" }
+        }
+    }
+
+    private func speedText(_ value: Float) -> String {
+        if value == Float(Int(value)) { return "\(Int(value))x" }
+        return String(format: "%.2fx", value)
     }
 
     private func activateAudioSession() {
@@ -310,6 +477,16 @@ struct PlayerScreen: View {
         try? session.setCategory(.playback, mode: .moviePlayback, options: [])
         try? session.setActive(true)
     }
+}
+
+struct ShareSheet: UIViewControllerRepresentable {
+    let items: [Any]
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
 
 struct WebView: UIViewRepresentable {
@@ -388,12 +565,13 @@ struct DownloadRow: View {
 
 struct FilesView: View {
     @ObservedObject var store: Store
+    @ObservedObject private var thumbs = ThumbnailCenter.shared
     @State private var playTarget: PlayTarget? = nil
 
     var body: some View {
+        let files = store.files()
         NavigationStack {
             List {
-                let files = store.files()
                 if files.isEmpty {
                     ContentUnavailableView("暂无文件", systemImage: "folder",
                                            description: Text("下载完成的视频会出现在这里，也会同步到「文件」App"))
@@ -404,9 +582,7 @@ struct FilesView: View {
                         playTarget = PlayTarget(title: file.name, remote: nil, direct: url, kind: .file)
                     } label: {
                         HStack(spacing: 12) {
-                            Image(systemName: "film")
-                                .frame(width: 26)
-                                .foregroundStyle(Color(red: 0, green: 0.52, blue: 0.6))
+                            localThumb(for: file)
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(file.name).font(.subheadline).foregroundStyle(.primary).lineLimit(1)
                                 Text("\(file.sizeText) · \(file.modified.formatted(date: .numeric, time: .shortened))")
@@ -429,9 +605,31 @@ struct FilesView: View {
                 }
             }
             .navigationTitle("本地文件")
+            .task(id: files.count) { thumbs.ensureLocal(files) }
             .fullScreenCover(item: $playTarget) { target in
                 PlayerScreen(target: target)
             }
+        }
+    }
+
+    @ViewBuilder
+    private func localThumb(for file: LocalFile) -> some View {
+        let key = ThumbnailStore.key(forLocal: file.name)
+        if let image = thumbs.image(key: key) {
+            Image(uiImage: image)
+                .resizable()
+                .aspectRatio(contentMode: .fill)
+                .frame(width: 64, height: 40)
+                .clipShape(RoundedRectangle(cornerRadius: 7))
+        } else {
+            RoundedRectangle(cornerRadius: 7)
+                .fill(Color(.tertiarySystemFill))
+                .frame(width: 64, height: 40)
+                .overlay(
+                    Image(systemName: "film")
+                        .font(.footnote)
+                        .foregroundStyle(Color(red: 0, green: 0.52, blue: 0.6))
+                )
         }
     }
 }
