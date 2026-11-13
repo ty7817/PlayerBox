@@ -115,8 +115,9 @@ final class Store: ObservableObject {
         state.links.removeAll { $0.id == link.id }
     }
 
-    func attach(localFile: String, to linkID: UUID) {
-        guard let idx = state.links.firstIndex(where: { $0.id == linkID }) else { return }
+    func attach(localFile: String, to linkID: UUID?) {
+        guard let linkID = linkID,
+              let idx = state.links.firstIndex(where: { $0.id == linkID }) else { return }
         state.links[idx].localFile = localFile
     }
 
@@ -164,9 +165,8 @@ enum LinkDetector {
     }
 
     static func fileExtension(_ urlString: String) -> String? {
-        guard var path = URL(string: urlString)?.path.lowercased() else { return nil }
-        if let q = path.firstIndex(of: "?") { path = String(path[path.startIndex..<q]) }
-        let ext = (path as NSString).pathExtension
+        guard let url = URL(string: urlString) else { return nil }
+        let ext = url.pathExtension.lowercased()
         return ext.isEmpty ? nil : ext
     }
 
@@ -180,6 +180,6 @@ enum LinkDetector {
     /// 内置解码器能否直接播
     static func nativePlayable(_ ext: String?) -> Bool {
         guard let ext = ext else { return false }
-        return ["mp4", "mov", "m4v", "ts", "mp3", "m4a", "aac", "wav", "flac", "opus"].contains(ext)
+        return ["mp4", "mov", "m4v", "ts", "mp3", "m4a", "aac", "wav", "flac", "opus"].contains(ext.lowercased())
     }
 }
