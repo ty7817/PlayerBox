@@ -31,13 +31,30 @@ jobs:
       - name: Generate Xcode project
         run: xcodegen generate
 
+      - name: Install CocoaPods
+        run: |
+          if ! command -v pod >/dev/null 2>&1; then
+            sudo gem install cocoapods --no-document
+          fi
+          pod --version
+
+      - name: Install VLC pods
+        id: pods
+        continue-on-error: true
+        run: |
+          set +e
+          pod install --verbose > pod.log 2>&1
+          echo "POD_EXIT_CODE=$?" >> pod.log
+          tail -n 30 pod.log
+
       - name: Build app
         id: build
+        if: steps.pods.outcome == 'success'
         continue-on-error: true
         run: |
           set +e
           xcodebuild \
-            -project PlayerBox.xcodeproj \
+            -workspace PlayerBox.xcworkspace \
             -scheme PlayerBox \
             -sdk iphoneos \
             -configuration Release \
@@ -57,6 +74,14 @@ jobs:
             echo ""
             echo "时间：$(date -u)"
             echo ""
+            if [ -f pod.log ]; then
+              echo "## pod install"
+              echo '```'
+              grep -nE "error|Error|Installing|Downloading|POD_EXIT_CODE|Unable|failed" pod.log | head -40 || true
+              echo '```'
+              echo ""
+            fi
+            echo "## xcodebuild"
             echo '```'
             grep -nE "error:|warning:|BUILD FAILED|BUILD SUCCEEDED|The following build commands failed|EXIT_CODE" build.log | head -120 || true
             echo '```'
@@ -98,7 +123,7 @@ jobs:
           tag_name: build-${{ github.run_number }}
           name: PlayerBox build ${{ github.run_number }}
           body: |
-            未签名 IPA，构建自 ${{ github.sha }}
+            未签名 IPA（VLC 内核），构建自 ${{ github.sha }}
             安装前需自行签名（全能签 / Sideloadly / ESign / AltStore）。
           files: PlayerBox-unsigned.ipa
           draft: false

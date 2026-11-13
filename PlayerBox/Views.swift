@@ -227,8 +227,11 @@ struct PlayerScreen: View {
     let target: PlayTarget
     @Environment(\.dismiss) private var dismiss
 
+    @StateObject private var vlc = VLCController()
+
     @State private var player: AVPlayer? = nil
     @State private var useWeb = false
+    @State private var useVLC = false
     @State private var errorText = ""
     @State private var isReady = false
     @State private var speed: Float = 1
@@ -245,7 +248,7 @@ struct PlayerScreen: View {
             overlay
         }
         .onAppear { prepare() }
-        .onDisappear { player?.pause() }
+        .onDisappear { player?.pause(); vlc.pause() }
         .onReceive(NotificationCenter.default.publisher(for: .AVPlayerItemDidPlayToEndTime)) { _ in
             guard isLooping, let player = player else { return }
             player.seek(to: .zero)
@@ -260,6 +263,9 @@ struct PlayerScreen: View {
     private var content: some View {
         if useWeb {
             WebView(urlString: target.remote?.absoluteString ?? "")
+                .ignoresSafeArea()
+        } else if useVLC {
+            VLCVideoSurface(player: vlc.player)
                 .ignoresSafeArea()
         } else if let player = player {
             VideoPlayer(player: player)
@@ -276,6 +282,7 @@ struct PlayerScreen: View {
             HStack(spacing: 10) {
                 Button {
                     player?.pause()
+                    vlc.pause()
                     dismiss()
                 } label: {
                     Image(systemName: "xmark")
@@ -293,10 +300,8 @@ struct PlayerScreen: View {
                     }
                 }
                 if !errorText.isEmpty && !useWeb {
-                    Button("用网页播") {
-                        player?.pause()
-                        useWeb = true
-                        errorText = ""
+                    Button(useVLC ? "用网页播" : "用 VLC 内核") {
+                        if useVLC { switchToWeb() } else { switchToVLC() }
                     }
                     .font(.caption)
                     .padding(.horizontal, 12).padding(.vertical, 8)
@@ -306,7 +311,15 @@ struct PlayerScreen: View {
             .padding(.horizontal, 16)
             .padding(.top, 8)
 
-            if !isReady && player != nil && !useWeb {
+            if useVLC && !vlc.stateText.isEmpty {
+                Text(vlc.stateText)
+                    .font(.caption)
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 12).padding(.vertical, 6)
+                    .background(.black.opacity(0.45), in: Capsule())
+            }
+
+            if !useVLC && !isReady && player != nil && !useWeb {
                 Text("缓冲中…")
                     .font(.caption)
                     .foregroundStyle(.white)
@@ -326,7 +339,7 @@ struct PlayerScreen: View {
 
             Spacer()
 
-            if player != nil && !useWeb {
+            if (player != nil || useVLC) && !useWeb {
                 actionBar
             }
 
@@ -343,6 +356,12 @@ struct PlayerScreen: View {
 
     private var actionBar: some View {
         HStack(spacing: 12) {
+            if useVLC {
+                Button { vlc.toggle() } label: {
+                    pill(vlc.isPlaying ? "暂停" : "播放", icon: vlc.isPlaying ? "pause.fill" : "play.fill")
+                }
+            }
+
             Menu {
                 ForEach([0.5, 0.75, 1.0, 1.25, 1.5, 2.0], id: \.self) { value in
                     Button {
@@ -357,8 +376,11 @@ struct PlayerScreen: View {
 
             Button { jump(-15) } label: { pill("-15s", icon: "gobackward.15") }
             Button { jump(15) } label: { pill("+15s", icon: "goforward.15") }
-            Button { toggleMute() } label: {
-                pill(isMuted ? "静音" : "有声", icon: isMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
+
+            if !useVLC {
+                Button { toggleMute() } label: {
+                    pill(isMuted ? "静音" : "有声", icon: isMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                }
             }
 
             Menu {
@@ -406,7 +428,7 @@ struct PlayerScreen: View {
 
         let ext = url.pathExtension.lowercased()
         if target.kind == .file, !ext.isEmpty, !LinkDetector.nativePlayable(ext) {
-            errorText = "内置播放器不支持 .\(ext)。点「更多 → 分享」可用 VLC / nPlayer / Infuse 打开"
+            startVLC(url)
             return
         }
 
@@ -432,8 +454,32 @@ struct PlayerScreen: View {
             }
     }
 
+    private func startVLC(_ url: URL) {
+        player?.pause()
+        player = nil
+        errorText = ""
+        useVLC = true
+        vlc.load(url)
+        vlc.play()
+        vlc.setRate(speed)
+    }
+
+    private func switchToVLC() {
+        guard let url = target.direct ?? target.remote else { return }
+        startVLC(url)
+    }
+
+    private func switchToWeb() {
+        player?.pause()
+        vlc.pause()
+        useVLC = false
+        useWeb = true
+        errorText = ""
+    }
+
     private func setSpeed(_ value: Float) {
         speed = value
+        if useVLC { vlc.setRate(value); return }
         guard let player = player else { return }
         player.defaultRate = value
         if player.timeControlStatus == .playing {
@@ -442,6 +488,7 @@ struct PlayerScreen: View {
     }
 
     private func jump(_ seconds: Double) {
+        if useVLC { vlc.jump(seconds); return }
         guard let player = player else { return }
         var target = CMTimeAdd(player.currentTime(), CMTime(seconds: seconds, preferredTimescale: 600))
         if CMTimeCompare(target, .zero) < 0 { target = .zero }
