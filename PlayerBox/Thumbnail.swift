@@ -20,8 +20,13 @@ enum ThumbnailStore {
         return base.appendingPathComponent("Media", isDirectory: true)
     }
 
-    static func key(forRemote urlString: String) -> String { digest("remote:" + urlString) }
-    static func key(forLocal name: String) -> String { digest("local:" + name) }
+    static func key(forRemote urlString: String, percent: Double, preferCover: Bool) -> String {
+        digest("remote:\(urlString)|p\(Int(percent))|c\(preferCover ? 1 : 0)")
+    }
+
+    static func key(forLocal name: String, percent: Double, preferCover: Bool) -> String {
+        digest("local:\(name)|p\(Int(percent))|c\(preferCover ? 1 : 0)")
+    }
 
     private static func digest(_ text: String) -> String {
         let hash = SHA256.hash(data: Data(text.utf8))
@@ -36,13 +41,14 @@ enum ThumbnailStore {
     }
 
     @discardableResult
-    static func generateRemote(urlString: String, localName: String?, isPage: Bool, key: String) async -> Bool {
+    static func generateRemote(urlString: String, localName: String?, isPage: Bool,
+                               key: String, percent: Double, preferCover: Bool) async -> Bool {
         if cachedImage(key: key) != nil { return true }
 
         if let localName = localName {
             let local = mediaDir.appendingPathComponent(localName)
             if FileManager.default.fileExists(atPath: local.path),
-               let image = await imageFromVideo(local) {
+               let image = await imageFromVideo(local, percent: percent, preferCover: preferCover) {
                 return save(image, key: key)
             }
         }
@@ -54,39 +60,62 @@ enum ThumbnailStore {
             return false
         }
 
-        if let image = await imageFromVideo(url) { return save(image, key: key) }
+        if let image = await imageFromVideo(url, percent: percent, preferCover: preferCover) {
+            return save(image, key: key)
+        }
         if let image = await imageFromPage(url) { return save(image, key: key) }
         return false
     }
 
     @discardableResult
-    static func generateLocal(name: String, key: String) async -> Bool {
+    static func generateLocal(name: String, key: String, percent: Double, preferCover: Bool) async -> Bool {
         if cachedImage(key: key) != nil { return true }
         let local = mediaDir.appendingPathComponent(name)
-        guard let image = await imageFromVideo(local) else { return false }
+        guard let image = await imageFromVideo(local, percent: percent, preferCover: preferCover) else { return false }
         return save(image, key: key)
     }
 
     // MARK: 抽帧
 
-    private static func imageFromVideo(_ url: URL) async -> UIImage? {
+    private static func imageFromVideo(_ url: URL, percent: Double, preferCover: Bool) async -> UIImage? {
         let asset = AVURLAsset(url: url)
+
+        if preferCover, let cover = await embeddedCover(asset) {
+            return cover
+        }
+
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
         generator.maximumSize = CGSize(width: 720, height: 405)
         generator.requestedTimeToleranceBefore = CMTime(seconds: 3, preferredTimescale: 600)
         generator.requestedTimeToleranceAfter = CMTime(seconds: 3, preferredTimescale: 600)
-        do {
-            let result = try await generator.image(at: CMTime(seconds: 1, preferredTimescale: 600))
-            return UIImage(cgImage: result.image)
-        } catch {
-            do {
-                let result = try await generator.image(at: .zero)
-                return UIImage(cgImage: result.image)
-            } catch {
-                return nil
+
+        var seconds = 1.0
+        if let duration = try? await asset.load(.duration) {
+            let total = CMTimeGetSeconds(duration)
+            if total.isFinite, total > 0 {
+                seconds = max(0.5, total * percent / 100.0)
             }
         }
+
+        if let image = try? await generator.image(at: CMTime(seconds: seconds, preferredTimescale: 600)).image {
+            return UIImage(cgImage: image)
+        }
+        if let image = try? await generator.image(at: .zero).image {
+            return UIImage(cgImage: image)
+        }
+        return nil
+    }
+
+    private static func embeddedCover(_ asset: AVURLAsset) async -> UIImage? {
+        guard let metadata = try? await asset.load(.commonMetadata) else { return nil }
+        for item in metadata where item.commonKey == .commonKeyArtwork {
+            if let data = try? await item.load(.dataValue),
+               let image = UIImage(data: data) {
+                return image
+            }
+        }
+        return nil
     }
 
     // MARK: 网页 og:image
@@ -178,8 +207,11 @@ final class ThumbnailCenter: ObservableObject {
     }
 
     func ensureRemote(_ links: [MediaLink]) {
+        let percent = SettingsStore.shared.value.previewPercent
+        let preferCover = SettingsStore.shared.value.preferEmbeddedCover
+
         for link in links {
-            let key = ThumbnailStore.key(forRemote: link.url)
+            let key = ThumbnailStore.key(forRemote: link.url, percent: percent, preferCover: preferCover)
             guard image(key: key) == nil, !running.contains(key) else { continue }
             running.insert(key)
             let urlString = link.url
@@ -189,20 +221,26 @@ final class ThumbnailCenter: ObservableObject {
                 _ = await ThumbnailStore.generateRemote(urlString: urlString,
                                                        localName: localName,
                                                        isPage: isPage,
-                                                       key: key)
+                                                       key: key,
+                                                       percent: percent,
+                                                       preferCover: preferCover)
                 self.finish(key: key)
             }
         }
     }
 
     func ensureLocal(_ files: [LocalFile]) {
+        let percent = SettingsStore.shared.value.previewPercent
+        let preferCover = SettingsStore.shared.value.preferEmbeddedCover
+
         for file in files {
-            let key = ThumbnailStore.key(forLocal: file.name)
+            let key = ThumbnailStore.key(forLocal: file.name, percent: percent, preferCover: preferCover)
             guard image(key: key) == nil, !running.contains(key) else { continue }
             running.insert(key)
             let name = file.name
             Task { @MainActor in
-                _ = await ThumbnailStore.generateLocal(name: name, key: key)
+                _ = await ThumbnailStore.generateLocal(name: name, key: key,
+                                                       percent: percent, preferCover: preferCover)
                 self.finish(key: key)
             }
         }
@@ -218,6 +256,12 @@ final class ThumbnailCenter: ObservableObject {
 
     func refresh(key: String) {
         memory[key] = nil
+        version += 1
+    }
+
+    func clearCache() {
+        memory.removeAll()
+        running.removeAll()
         version += 1
     }
 }
