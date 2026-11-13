@@ -11,6 +11,8 @@ struct AppSettings: Codable {
     // 手势
     var doubleTapToggle: Bool = true
     var swipeSeek: Bool = true
+    var brightnessSwipe: Bool = true
+    var volumeSwipe: Bool = true
 
     // 媒体控制
     var keepAwake: Bool = true
@@ -24,6 +26,29 @@ struct AppSettings: Codable {
     var showPreview: Bool = true
     var previewPercent: Double = 10
     var preferEmbeddedCover: Bool = true
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        defaultSpeed = try c.decodeIfPresent(Double.self, forKey: .defaultSpeed) ?? 1.0
+        loopPlayback = try c.decodeIfPresent(Bool.self, forKey: .loopPlayback) ?? false
+        bufferSeconds = try c.decodeIfPresent(Double.self, forKey: .bufferSeconds) ?? 2
+        engineMode = try c.decodeIfPresent(String.self, forKey: .engineMode) ?? "auto"
+        doubleTapToggle = try c.decodeIfPresent(Bool.self, forKey: .doubleTapToggle) ?? true
+        swipeSeek = try c.decodeIfPresent(Bool.self, forKey: .swipeSeek) ?? true
+        brightnessSwipe = try c.decodeIfPresent(Bool.self, forKey: .brightnessSwipe) ?? true
+        volumeSwipe = try c.decodeIfPresent(Bool.self, forKey: .volumeSwipe) ?? true
+        keepAwake = try c.decodeIfPresent(Bool.self, forKey: .keepAwake) ?? true
+        backgroundAudio = try c.decodeIfPresent(Bool.self, forKey: .backgroundAudio) ?? true
+        showCountInTitle = try c.decodeIfPresent(Bool.self, forKey: .showCountInTitle) ?? true
+        showFileTime = try c.decodeIfPresent(Bool.self, forKey: .showFileTime) ?? true
+        thumbnailFill = try c.decodeIfPresent(Bool.self, forKey: .thumbnailFill) ?? true
+        showScrollIndicators = try c.decodeIfPresent(Bool.self, forKey: .showScrollIndicators) ?? false
+        showPreview = try c.decodeIfPresent(Bool.self, forKey: .showPreview) ?? true
+        previewPercent = try c.decodeIfPresent(Double.self, forKey: .previewPercent) ?? 10
+        preferEmbeddedCover = try c.decodeIfPresent(Bool.self, forKey: .preferEmbeddedCover) ?? true
+    }
 }
 
 @MainActor
