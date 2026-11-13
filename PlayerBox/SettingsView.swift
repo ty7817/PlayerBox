@@ -229,18 +229,34 @@ struct GestureSettingsView: View {
 
     var body: some View {
         Form {
-            Section {
+            Section("点击") {
+                Toggle("单击隐藏 / 显示控制条", isOn: Binding(
+                    get: { settings.value.singleTapToggle },
+                    set: { settings.value.singleTapToggle = $0 }
+                ))
                 Toggle("双击暂停 / 继续播放", isOn: Binding(
                     get: { settings.value.doubleTapToggle },
                     set: { settings.value.doubleTapToggle = $0 }
                 ))
+            }
+
+            Section("滑动") {
                 Toggle("左右滑动快进 / 快退", isOn: Binding(
                     get: { settings.value.swipeSeek },
                     set: { settings.value.swipeSeek = $0 }
                 ))
+                Toggle("左半屏上下滑动调亮度", isOn: Binding(
+                    get: { settings.value.brightnessSwipe },
+                    set: { settings.value.brightnessSwipe = $0 }
+                ))
+                Toggle("右半屏上下滑动调音量", isOn: Binding(
+                    get: { settings.value.volumeSwipe },
+                    set: { settings.value.volumeSwipe = $0 }
+                ))
             }
+
             Section {
-                Text("向左滑快退 15 秒，向右滑快进 15 秒；手势仅在播放页生效。")
+                Text("左右滑动时，整屏宽度约对应 90 秒，滑得越远跳得越多；左侧上下滑调亮度，右侧上下滑调音量（上滑增加、下滑减少）。")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
@@ -295,6 +311,12 @@ struct VideoSettingsView: View {
                     Text("VLC 内核（全格式）").tag("vlc")
                 }
                 .pickerStyle(.inline)
+            }
+
+            Section("横竖屏") {
+                Text("播放页顶部工具栏有旋转按钮，可随时在横屏与竖屏之间切换；也可直接旋转手机。")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
             }
 
             Section {
