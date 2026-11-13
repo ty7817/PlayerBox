@@ -303,12 +303,14 @@ struct PlayerScreen: View {
     @State private var cancellable: AnyCancellable? = nil
 
     @State private var controlsVisible = true
-    @State private var hud: PlayerHUD? = nil
+    @State private var controlsLocked = false
     @State private var dragMode: DragMode = .none
     @State private var dragStartSeconds: Double = 0
     @State private var dragStartValue: Float = 0
     @State private var dragSeekTarget: Double = 0
-    @State private var hudTask: Task<Void, Never>? = nil
+
+    /// 滑动灵敏度：整屏宽度对应的秒数（越大越灵敏）
+    private let seekSecondsPerScreen: Double = 300
 
     var body: some View {
         ZStack {
@@ -317,20 +319,23 @@ struct PlayerScreen: View {
             videoArea
 
             if isBuffering {
-                VStack(spacing: 10) {
-                    ProgressView().tint(.white).scaleEffect(1.2)
-                    Text("缓冲中…").font(.caption).foregroundStyle(.white.opacity(0.8))
+                VStack(spacing: 12) {
+                    ProgressView()
+                        .progressViewStyle(.circular)
+                        .tint(.white)
+                        .scaleEffect(1.5)
+                    Text("缓冲中…")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.white.opacity(0.75))
                 }
             }
 
             if useVLC && !vlc.stateText.isEmpty {
-                VStack(spacing: 10) {
-                    ProgressView().tint(.white).scaleEffect(1.2)
-                    Text(vlc.stateText).font(.caption).foregroundStyle(.white.opacity(0.8))
+                VStack(spacing: 12) {
+                    ProgressView().tint(.white).scaleEffect(1.5)
+                    Text(vlc.stateText).font(.system(size: 12)).foregroundStyle(.white.opacity(0.75))
                 }
             }
-
-            hudView
 
             if controlsVisible {
                 VStack(spacing: 0) {
@@ -339,8 +344,28 @@ struct PlayerScreen: View {
                     if !errorText.isEmpty { errorBanner }
                     bottomBar
                 }
-                .padding(.top, 6)
                 .transition(.opacity)
+            }
+
+            if controlsLocked {
+                VStack {
+                    Spacer()
+                    HStack {
+                        Button {
+                            controlsLocked = false
+                            withAnimation { controlsVisible = true }
+                        } label: {
+                            Image(systemName: "lock.fill")
+                                .font(.system(size: 15))
+                                .foregroundStyle(.white.opacity(0.7))
+                                .frame(width: 44, height: 44)
+                                .contentShape(Rectangle())
+                        }
+                        Spacer()
+                    }
+                    .padding(.horizontal, 18)
+                    .padding(.bottom, 24)
+                }
             }
 
             if !toast.isEmpty {
@@ -353,6 +378,7 @@ struct PlayerScreen: View {
                     .padding(.bottom, 190)
             }
         }
+        .statusBarHidden(true)
         .onAppear { prepare() }
         .onDisappear { teardown() }
         .onReceive(NotificationCenter.default.publisher(for: .AVPlayerItemDidPlayToEndTime)) { _ in
@@ -381,7 +407,7 @@ struct PlayerScreen: View {
             .contentShape(Rectangle())
             .simultaneousGesture(tapGesture)
             .gesture(
-                DragGesture(minimumDistance: 14)
+                DragGesture(minimumDistance: 12)
                     .onChanged { value in handleDragChanged(value, size: geo.size) }
                     .onEnded { value in handleDragEnded(value) }
             )
@@ -391,10 +417,11 @@ struct PlayerScreen: View {
 
     private var tapGesture: some Gesture {
         TapGesture(count: 2).onEnded {
+            guard !controlsLocked else { return }
             if settings.value.doubleTapToggle { togglePlayback() }
         }
         .exclusively(before: TapGesture(count: 1).onEnded {
-            guard settings.value.singleTapToggle else { return }
+            guard settings.value.singleTapToggle, !controlsLocked else { return }
             withAnimation(.easeInOut(duration: 0.22)) { controlsVisible.toggle() }
         })
     }
@@ -403,7 +430,7 @@ struct PlayerScreen: View {
         if dragMode == .none {
             let dx = value.translation.width
             let dy = value.translation.height
-            guard max(abs(dx), abs(dy)) > 16 else { return }
+            guard max(abs(dx), abs(dy)) > 12 else { return }
 
             if abs(dx) > abs(dy) {
                 guard settings.value.swipeSeek else { return }
@@ -423,32 +450,17 @@ struct PlayerScreen: View {
 
         switch dragMode {
         case .seek:
-            let fullRange: Double = 90
-            let delta = Double(value.translation.width / max(size.width, 1)) * fullRange
+            let delta = Double(value.translation.width / max(size.width, 1)) * seekSecondsPerScreen
             let maxTime = displayDuration > 0 ? displayDuration : max(dragStartSeconds + 3600, 1)
             dragSeekTarget = min(max(dragStartSeconds + delta, 0), maxTime)
-            hud = PlayerHUD(
-                icon: delta >= 0 ? "goforward" : "gobackward",
-                title: (delta >= 0 ? "快进 " : "快退 ") + "\(Int(abs(delta)))s",
-                detail: "\(timeText(dragSeekTarget)) / \(timeText(displayDuration))",
-                progress: displayDuration > 0 ? dragSeekTarget / displayDuration : -1
-            )
 
         case .brightness:
             let level = min(max(dragStartValue + Float(-value.translation.height / max(size.height, 1)), 0), 1)
             UIScreen.main.brightness = CGFloat(level)
-            hud = PlayerHUD(icon: "sun.max.fill",
-                            title: "亮度 \(Int(level * 100))%",
-                            detail: "上滑增加 · 下滑减少",
-                            progress: Double(level))
 
         case .volume:
             let level = min(max(dragStartValue + Float(-value.translation.height / max(size.height, 1)), 0), 1)
             VolumeControl.shared.set(level)
-            hud = PlayerHUD(icon: level <= 0.01 ? "speaker.slash.fill" : "speaker.wave.2.fill",
-                            title: "音量 \(Int(level * 100))%",
-                            detail: "上滑增加 · 下滑减少",
-                            progress: Double(level))
 
         case .none:
             break
@@ -460,67 +472,51 @@ struct PlayerScreen: View {
             seek(dragSeekTarget)
         }
         dragMode = .none
-        hudTask?.cancel()
-        hudTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 900_000_000)
-            if !Task.isCancelled {
-                withAnimation(.easeOut(duration: 0.2)) { hud = nil }
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var hudView: some View {
-        if let hud = hud {
-            VStack(spacing: 8) {
-                Image(systemName: hud.icon).font(.system(size: 24))
-                Text(hud.title).font(.system(size: 15, weight: .semibold))
-                if !hud.detail.isEmpty {
-                    Text(hud.detail).font(.system(size: 11)).foregroundStyle(.white.opacity(0.75))
-                }
-                if hud.progress >= 0 {
-                    ProgressView(value: min(max(hud.progress, 0), 1))
-                        .progressViewStyle(.linear)
-                        .tint(.white)
-                        .frame(width: 150)
-                }
-            }
-            .foregroundStyle(.white)
-            .padding(.horizontal, 22)
-            .padding(.vertical, 16)
-            .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 14))
-            .transition(.opacity)
-        }
     }
 
     // MARK: 顶部
 
     private var topBar: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 24) {
             Button { closePlayer() } label: {
                 Image(systemName: "xmark")
-                    .font(.system(size: 17, weight: .semibold))
+                    .font(.system(size: 22, weight: .regular))
                     .foregroundStyle(.white)
                     .frame(width: 34, height: 34)
                     .contentShape(Rectangle())
             }
 
-            Text(displayTitle)
-                .font(.caption)
-                .foregroundStyle(.white.opacity(0.85))
-                .lineLimit(1)
-                .truncationMode(.middle)
-
-            Spacer(minLength: 6)
-
             Button { OrientationSupport.toggle() } label: {
-                topIcon("arrow.triangle.2.circlepath")
+                Image(systemName: "arrow.triangle.2.circlepath")
+                    .font(.system(size: 20))
+                    .foregroundStyle(.white)
+                    .frame(width: 34, height: 34)
+                    .contentShape(Rectangle())
             }
 
-            if let file = target.direct {
-                ShareLink(item: file) { topIcon("square.and.arrow.up") }
-            } else if let remote = target.remote {
-                ShareLink(item: remote) { topIcon("square.and.arrow.up") }
+            Button { isLooping.toggle() } label: {
+                Image(systemName: "repeat")
+                    .font(.system(size: 20))
+                    .foregroundStyle(isLooping ? Color(red: 0.35, green: 0.85, blue: 0.4) : Color.white.opacity(0.85))
+                    .frame(width: 34, height: 34)
+                    .contentShape(Rectangle())
+            }
+
+            Text(displayTitle)
+                .font(.system(size: 13))
+                .foregroundStyle(.white.opacity(0.9))
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .padding(.leading, 6)
+
+            Spacer(minLength: 8)
+
+            Button { captureScreenshot() } label: {
+                Image(systemName: "camera")
+                    .font(.system(size: 19))
+                    .foregroundStyle(.white)
+                    .frame(width: 34, height: 34)
+                    .contentShape(Rectangle())
             }
 
             Menu {
@@ -529,10 +525,10 @@ struct PlayerScreen: View {
                 }
             } label: {
                 Text(speedText(speed))
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(.white)
                     .frame(width: 34, height: 34)
-                    .background(.white.opacity(0.14), in: Circle())
+                    .background(.white.opacity(0.16), in: Circle())
             }
 
             Menu {
@@ -548,37 +544,61 @@ struct PlayerScreen: View {
                 }
             } label: {
                 Image(systemName: "ellipsis")
-                    .font(.system(size: 15, weight: .semibold))
+                    .font(.system(size: 20))
                     .foregroundStyle(.white)
                     .frame(width: 34, height: 34)
                     .contentShape(Rectangle())
             }
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 6)
+        .padding(.horizontal, 18)
+        .padding(.vertical, 8)
         .background(
-            LinearGradient(colors: [.black.opacity(0.55), .black.opacity(0.0)],
+            LinearGradient(colors: [.black.opacity(0.5), .black.opacity(0.0)],
                            startPoint: .top, endPoint: .bottom)
             .ignoresSafeArea(edges: .top)
         )
     }
 
-    private func topIcon(_ name: String) -> some View {
-        Image(systemName: name)
-            .font(.system(size: 15, weight: .semibold))
-            .foregroundStyle(.white)
-            .frame(width: 34, height: 34)
-            .contentShape(Rectangle())
-    }
-
     // MARK: 底部
 
     private var bottomBar: some View {
-        VStack(spacing: 10) {
+        VStack(spacing: 6) {
+            HStack(spacing: 26) {
+                Spacer()
+                Button { toggleMute() } label: {
+                    Image(systemName: isMuted ? "speaker.slash" : "speaker.wave.2")
+                        .font(.system(size: 17))
+                        .foregroundStyle(.white.opacity(useVLC ? 0.3 : 0.85))
+                        .frame(width: 34, height: 34)
+                        .contentShape(Rectangle())
+                }
+                .disabled(useVLC)
+
+                Menu {
+                    Toggle("循环播放", isOn: $isLooping)
+                    Button("复制链接") { copyLink() }
+                    Button("截图保存到本地") { captureScreenshot() }
+                    if !errorText.isEmpty && !useWeb {
+                        if useVLC {
+                            Button("用网页播") { switchToWeb() }
+                        } else if target.kind != .page {
+                            Button("用 VLC 内核") { switchToVLC() }
+                        }
+                    }
+                } label: {
+                    Image(systemName: "list.bullet")
+                        .font(.system(size: 17))
+                        .foregroundStyle(.white.opacity(0.85))
+                        .frame(width: 34, height: 34)
+                        .contentShape(Rectangle())
+                }
+            }
+
             HStack(spacing: 10) {
                 Text(timeText(displayCurrent))
-                    .font(.system(size: 12, weight: .medium).monospacedDigit())
+                    .font(.system(size: 13).monospacedDigit())
                     .foregroundStyle(.white)
+                    .frame(width: 52, alignment: .leading)
 
                 Slider(value: Binding(
                     get: { bus.scrubbing ? scrubValue : displayCurrent },
@@ -595,79 +615,83 @@ struct PlayerScreen: View {
                 .tint(.white)
 
                 Text(timeText(displayDuration))
-                    .font(.system(size: 12, weight: .medium).monospacedDigit())
+                    .font(.system(size: 13).monospacedDigit())
                     .foregroundStyle(.white)
+                    .frame(width: 52, alignment: .trailing)
             }
 
-            HStack(spacing: 42) {
-                Button { jump(-15) } label: {
-                    VStack(spacing: 2) {
-                        Image(systemName: "gobackward.15").font(.system(size: 19))
-                        Text("-15s").font(.system(size: 9))
-                    }
-                    .foregroundStyle(.white)
-                    .frame(width: 52, height: 44)
-                    .contentShape(Rectangle())
+            HStack {
+                Button {
+                    controlsLocked = true
+                    withAnimation { controlsVisible = false }
+                } label: {
+                    Image(systemName: "lock.open")
+                        .font(.system(size: 18))
+                        .foregroundStyle(.white.opacity(0.8))
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
                 }
+
+                Spacer()
+
+                Button { jump(-15) } label: {
+                    Image(systemName: "gobackward.15")
+                        .font(.system(size: 24))
+                        .foregroundStyle(.white)
+                        .frame(width: 54, height: 48)
+                        .contentShape(Rectangle())
+                }
+
+                Spacer(minLength: 10)
 
                 Button { togglePlayback() } label: {
                     Image(systemName: playingIcon)
                         .font(.system(size: 30, weight: .semibold))
                         .foregroundStyle(.white)
-                        .frame(width: 64, height: 64)
+                        .frame(width: 60, height: 48)
                         .contentShape(Rectangle())
                 }
 
+                Spacer(minLength: 10)
+
                 Button { jump(15) } label: {
-                    VStack(spacing: 2) {
-                        Image(systemName: "goforward.15").font(.system(size: 19))
-                        Text("+15s").font(.system(size: 9))
+                    Image(systemName: "goforward.15")
+                        .font(.system(size: 24))
+                        .foregroundStyle(.white)
+                        .frame(width: 54, height: 48)
+                        .contentShape(Rectangle())
+                }
+
+                Spacer()
+
+                Menu {
+                    Toggle("循环播放", isOn: $isLooping)
+                    Button("复制链接") { copyLink() }
+                    Button("截图保存到本地") { captureScreenshot() }
+                    if !errorText.isEmpty && !useWeb {
+                        if useVLC {
+                            Button("用网页播") { switchToWeb() }
+                        } else if target.kind != .page {
+                            Button("用 VLC 内核") { switchToVLC() }
+                        }
                     }
-                    .foregroundStyle(.white)
-                    .frame(width: 52, height: 44)
-                    .contentShape(Rectangle())
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                        .font(.system(size: 19))
+                        .foregroundStyle(.white.opacity(0.85))
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
                 }
             }
-
-            HStack(spacing: 22) {
-                Button { toggleMute() } label: {
-                    bottomLabel(isMuted ? "静音" : "有声", icon: isMuted ? "speaker.slash" : "speaker.wave.2")
-                }
-                .disabled(useVLC)
-                .opacity(useVLC ? 0.3 : 1)
-
-                Button { isLooping.toggle() } label: {
-                    bottomLabel(isLooping ? "循环开" : "循环关", icon: "repeat")
-                }
-
-                Button { jump(-30) } label: {
-                    bottomLabel("退 30s", icon: "backward.end")
-                }
-
-                Button { jump(30) } label: {
-                    bottomLabel("进 30s", icon: "forward.end")
-                }
-            }
-            .padding(.bottom, 4)
         }
         .padding(.horizontal, 18)
-        .padding(.top, 14)
-        .padding(.bottom, 20)
+        .padding(.top, 10)
+        .padding(.bottom, 14)
         .background(
-            LinearGradient(colors: [.black.opacity(0.0), .black.opacity(0.62)],
+            LinearGradient(colors: [.black.opacity(0.0), .black.opacity(0.55)],
                            startPoint: .top, endPoint: .bottom)
             .ignoresSafeArea(edges: .bottom)
         )
-    }
-
-    private func bottomLabel(_ text: String, icon: String) -> some View {
-        VStack(spacing: 3) {
-            Image(systemName: icon).font(.system(size: 15))
-            Text(text).font(.system(size: 9))
-        }
-        .foregroundStyle(.white.opacity(0.78))
-        .frame(minWidth: 44, minHeight: 40)
-        .contentShape(Rectangle())
     }
 
     private var errorBanner: some View {
@@ -800,7 +824,6 @@ struct PlayerScreen: View {
         player?.pause()
         player = nil
         vlc.pause()
-        hudTask?.cancel()
         UIApplication.shared.isIdleTimerDisabled = false
     }
 
