@@ -9,6 +9,7 @@ struct AppSettings: Codable {
     var engineMode: String = "auto"
 
     // 手势
+    var singleTapToggle: Bool = true
     var doubleTapToggle: Bool = true
     var swipeSeek: Bool = true
     var brightnessSwipe: Bool = true
@@ -35,6 +36,7 @@ struct AppSettings: Codable {
         loopPlayback = try c.decodeIfPresent(Bool.self, forKey: .loopPlayback) ?? false
         bufferSeconds = try c.decodeIfPresent(Double.self, forKey: .bufferSeconds) ?? 2
         engineMode = try c.decodeIfPresent(String.self, forKey: .engineMode) ?? "auto"
+        singleTapToggle = try c.decodeIfPresent(Bool.self, forKey: .singleTapToggle) ?? true
         doubleTapToggle = try c.decodeIfPresent(Bool.self, forKey: .doubleTapToggle) ?? true
         swipeSeek = try c.decodeIfPresent(Bool.self, forKey: .swipeSeek) ?? true
         brightnessSwipe = try c.decodeIfPresent(Bool.self, forKey: .brightnessSwipe) ?? true
