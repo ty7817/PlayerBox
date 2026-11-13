@@ -38,6 +38,8 @@ struct RootView: View {
                 .tabItem { Label("下载", systemImage: "arrow.down.circle") }
             FilesView(store: store)
                 .tabItem { Label("本地", systemImage: "folder") }
+            SettingsView()
+                .tabItem { Label("设置", systemImage: "gear") }
         }
         .tint(Color(red: 0, green: 0.52, blue: 0.6))
     }
@@ -48,6 +50,7 @@ struct RootView: View {
 struct LinksView: View {
     @ObservedObject var store: Store
     @ObservedObject private var thumbs = ThumbnailCenter.shared
+    @ObservedObject private var settings = SettingsStore.shared
     @State private var showAdd = false
     @State private var playing: PlayTarget? = nil
     @State private var toast = ""
@@ -83,7 +86,8 @@ struct LinksView: View {
                     }
                 }
             }
-            .navigationTitle("播放链接")
+            .navigationTitle(navTitle)
+            .scrollIndicators(settings.value.showScrollIndicators ? .visible : .hidden)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button { showAdd = true } label: { Image(systemName: "plus") }
@@ -103,6 +107,10 @@ struct LinksView: View {
                 Button("好") { toast = "" }
             } message: { Text(toast) }
         }
+    }
+
+    private var navTitle: String {
+        settings.value.showCountInTitle ? "播放链接（\(store.state.links.count)）" : "播放链接"
     }
 
     private func row(_ link: MediaLink) -> some View {
@@ -133,23 +141,33 @@ struct LinksView: View {
 
     @ViewBuilder
     private func thumb(for link: MediaLink) -> some View {
-        let key = ThumbnailStore.key(forRemote: link.url)
-        if let image = thumbs.image(key: key) {
-            Image(uiImage: image)
-                .resizable()
-                .aspectRatio(contentMode: .fill)
-                .frame(width: 64, height: 40)
-                .clipShape(RoundedRectangle(cornerRadius: 7))
+        if settings.value.showPreview {
+            let key = ThumbnailStore.key(forRemote: link.url,
+                                         percent: settings.value.previewPercent,
+                                         preferCover: settings.value.preferEmbeddedCover)
+            if let image = thumbs.image(key: key) {
+                Image(uiImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: settings.value.thumbnailFill ? .fill : .fit)
+                    .frame(width: 64, height: 40)
+                    .clipShape(RoundedRectangle(cornerRadius: 7))
+            } else {
+                placeholder(for: link)
+            }
         } else {
-            RoundedRectangle(cornerRadius: 7)
-                .fill(Color(.tertiarySystemFill))
-                .frame(width: 64, height: 40)
-                .overlay(
-                    Image(systemName: link.kind.icon)
-                        .font(.footnote)
-                        .foregroundStyle(Color(red: 0, green: 0.52, blue: 0.6))
-                )
+            placeholder(for: link)
         }
+    }
+
+    private func placeholder(for link: MediaLink) -> some View {
+        RoundedRectangle(cornerRadius: 7)
+            .fill(Color(.tertiarySystemFill))
+            .frame(width: 64, height: 40)
+            .overlay(
+                Image(systemName: link.kind.icon)
+                    .font(.footnote)
+                    .foregroundStyle(Color(red: 0, green: 0.52, blue: 0.6))
+            )
     }
 
     private func download(_ link: MediaLink) {
@@ -228,6 +246,7 @@ struct PlayerScreen: View {
     @Environment(\.dismiss) private var dismiss
 
     @StateObject private var vlc = VLCController()
+    @ObservedObject private var settings = SettingsStore.shared
 
     @State private var player: AVPlayer? = nil
     @State private var useWeb = false
@@ -247,8 +266,28 @@ struct PlayerScreen: View {
             content
             overlay
         }
+        .contentShape(Rectangle())
+        .simultaneousGesture(
+            TapGesture(count: 2).onEnded {
+                if settings.value.doubleTapToggle { togglePlayback() }
+            }
+        )
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 40).onEnded { value in
+                guard settings.value.swipeSeek else { return }
+                let dx = value.translation.width
+                let dy = value.translation.height
+                guard abs(dx) > abs(dy), abs(dx) > 60 else { return }
+                jump(dx > 0 ? 15 : -15)
+                flash(dx > 0 ? "快进 15 秒" : "快退 15 秒")
+            }
+        )
         .onAppear { prepare() }
-        .onDisappear { player?.pause(); vlc.pause() }
+        .onDisappear {
+            player?.pause()
+            vlc.pause()
+            UIApplication.shared.isIdleTimerDisabled = false
+        }
         .onReceive(NotificationCenter.default.publisher(for: .AVPlayerItemDidPlayToEndTime)) { _ in
             guard isLooping, let player = player else { return }
             player.seek(to: .zero)
@@ -414,7 +453,13 @@ struct PlayerScreen: View {
     }
 
     private func prepare() {
+        speed = Float(settings.value.defaultSpeed)
+        isLooping = settings.value.loopPlayback
         activateAudioSession()
+
+        if settings.value.keepAwake {
+            UIApplication.shared.isIdleTimerDisabled = true
+        }
 
         if target.kind == .page && target.direct == nil {
             useWeb = true
@@ -426,14 +471,21 @@ struct PlayerScreen: View {
             return
         }
 
+        let mode = settings.value.engineMode
         let ext = url.pathExtension.lowercased()
-        if target.kind == .file, !ext.isEmpty, !LinkDetector.nativePlayable(ext) {
+
+        if mode == "vlc", target.kind != .page {
+            startVLC(url)
+            return
+        }
+
+        if target.kind == .file, !ext.isEmpty, !LinkDetector.nativePlayable(ext), mode == "auto" {
             startVLC(url)
             return
         }
 
         let item = AVPlayerItem(url: url)
-        item.preferredForwardBufferDuration = 2
+        item.preferredForwardBufferDuration = settings.value.bufferSeconds
         let newPlayer = AVPlayer(playerItem: item)
         newPlayer.automaticallyWaitsToMinimizeStalling = true
         newPlayer.defaultRate = speed
@@ -475,6 +527,19 @@ struct PlayerScreen: View {
         useVLC = false
         useWeb = true
         errorText = ""
+    }
+
+    private func togglePlayback() {
+        if useVLC {
+            vlc.toggle()
+            return
+        }
+        guard let player = player else { return }
+        if player.timeControlStatus == .playing {
+            player.pause()
+        } else {
+            player.play()
+        }
     }
 
     private func setSpeed(_ value: Float) {
@@ -521,9 +586,12 @@ struct PlayerScreen: View {
 
     private func activateAudioSession() {
         let session = AVAudioSession.sharedInstance()
-        try? session.setCategory(.playback, mode: .moviePlayback, options: [])
+        let quiet = !settings.value.backgroundAudio
+        try? session.setCategory(quiet ? .ambient : .playback, mode: .moviePlayback, options: [])
         try? session.setActive(true)
     }
+
+    private func speedLabel(_ value: Float) -> String { speedText(value) }
 }
 
 struct ShareSheet: UIViewControllerRepresentable {
@@ -613,6 +681,7 @@ struct DownloadRow: View {
 struct FilesView: View {
     @ObservedObject var store: Store
     @ObservedObject private var thumbs = ThumbnailCenter.shared
+    @ObservedObject private var settings = SettingsStore.shared
     @State private var playTarget: PlayTarget? = nil
 
     var body: some View {
@@ -632,7 +701,7 @@ struct FilesView: View {
                             localThumb(for: file)
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(file.name).font(.subheadline).foregroundStyle(.primary).lineLimit(1)
-                                Text("\(file.sizeText) · \(file.modified.formatted(date: .numeric, time: .shortened))")
+                                Text(subtitle(file))
                                     .font(.caption2).foregroundStyle(.secondary)
                             }
                             Spacer()
@@ -651,7 +720,8 @@ struct FilesView: View {
                     }
                 }
             }
-            .navigationTitle("本地文件")
+            .navigationTitle(navTitle(files))
+            .scrollIndicators(settings.value.showScrollIndicators ? .visible : .hidden)
             .task(id: files.count) { thumbs.ensureLocal(files) }
             .fullScreenCover(item: $playTarget) { target in
                 PlayerScreen(target: target)
@@ -659,24 +729,45 @@ struct FilesView: View {
         }
     }
 
+    private func navTitle(_ files: [LocalFile]) -> String {
+        settings.value.showCountInTitle ? "本地文件（\(files.count)）" : "本地文件"
+    }
+
+    private func subtitle(_ file: LocalFile) -> String {
+        if settings.value.showFileTime {
+            return "\(file.sizeText) · \(file.modified.formatted(date: .numeric, time: .shortened))"
+        }
+        return file.sizeText
+    }
+
     @ViewBuilder
     private func localThumb(for file: LocalFile) -> some View {
-        let key = ThumbnailStore.key(forLocal: file.name)
-        if let image = thumbs.image(key: key) {
-            Image(uiImage: image)
-                .resizable()
-                .aspectRatio(contentMode: .fill)
-                .frame(width: 64, height: 40)
-                .clipShape(RoundedRectangle(cornerRadius: 7))
+        if settings.value.showPreview {
+            let key = ThumbnailStore.key(forLocal: file.name,
+                                         percent: settings.value.previewPercent,
+                                         preferCover: settings.value.preferEmbeddedCover)
+            if let image = thumbs.image(key: key) {
+                Image(uiImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: settings.value.thumbnailFill ? .fill : .fit)
+                    .frame(width: 64, height: 40)
+                    .clipShape(RoundedRectangle(cornerRadius: 7))
+            } else {
+                localPlaceholder()
+            }
         } else {
-            RoundedRectangle(cornerRadius: 7)
-                .fill(Color(.tertiarySystemFill))
-                .frame(width: 64, height: 40)
-                .overlay(
-                    Image(systemName: "film")
-                        .font(.footnote)
-                        .foregroundStyle(Color(red: 0, green: 0.52, blue: 0.6))
-                )
+            localPlaceholder()
         }
+    }
+
+    private func localPlaceholder() -> some View {
+        RoundedRectangle(cornerRadius: 7)
+            .fill(Color(.tertiarySystemFill))
+            .frame(width: 64, height: 40)
+            .overlay(
+                Image(systemName: "film")
+                    .font(.footnote)
+                    .foregroundStyle(Color(red: 0, green: 0.52, blue: 0.6))
+            )
     }
 }
