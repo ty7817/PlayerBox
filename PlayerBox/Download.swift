@@ -9,6 +9,7 @@ final class DownloadItem: Identifiable, ObservableObject {
     let remoteURL: URL
     let linkID: UUID?
     var localName: String
+    var taskID: Int = -1
 
     @Published var progress: Double = 0
     @Published var statusText: String = "等待中"
@@ -29,7 +30,6 @@ enum TransferError: LocalizedError {
     case noSegments
     case badPlaylist
     case emptyFile
-    case cancelled
 
     var errorDescription: String? {
         switch self {
@@ -37,12 +37,11 @@ enum TransferError: LocalizedError {
         case .noSegments: return "m3u8 里没有找到分片地址"
         case .badPlaylist: return "m3u8 内容无法识别"
         case .emptyFile: return "下载回来是空文件"
-        case .cancelled: return "已取消"
         }
     }
 }
 
-// MARK: - 下载中心（直链用后台队列，m3u8 用前台任务）
+// MARK: - 下载中心
 
 @MainActor
 final class DownloadCenter: NSObject, ObservableObject {
@@ -51,7 +50,6 @@ final class DownloadCenter: NSObject, ObservableObject {
     @Published var items: [DownloadItem] = []
     var backgroundCompletion: (() -> Void)?
 
-    private var sessionTasks: [Int: URLSessionDownloadTask] = [:]
     private var streamTasks: [UUID: Task<Void, Never>] = [:]
 
     private lazy var session: URLSession = {
@@ -62,24 +60,21 @@ final class DownloadCenter: NSObject, ObservableObject {
         return URLSession(configuration: cfg, delegate: self, delegateQueue: OperationQueue.main)
     }()
 
-    // MARK: 直链下载
-
     func startFileDownload(title: String, remoteURL: URL, localName: String, linkID: UUID?) {
         let item = DownloadItem(title: title, remoteURL: remoteURL, localName: localName, linkID: linkID)
         item.statusText = "连接中…"
         items.insert(item, at: 0)
         let task = session.downloadTask(with: remoteURL)
-        sessionTasks[task.taskIdentifier] = task
+        item.taskID = task.taskIdentifier
         task.resume()
     }
-
-    // MARK: m3u8 下载
 
     func startStreamDownload(title: String, playlistURL: URL, localName: String, linkID: UUID?) {
         let item = DownloadItem(title: title, remoteURL: playlistURL, localName: localName, linkID: linkID)
         item.statusText = "解析分片…"
         items.insert(item, at: 0)
         let dest = Store.mediaDir.appendingPathComponent(localName)
+
         let task = Task { [weak self] in
             do {
                 try await M3U8Downloader.download(playlistURL: playlistURL, destURL: dest) { value in
@@ -117,9 +112,10 @@ final class DownloadCenter: NSObject, ObservableObject {
             try? FileManager.default.removeItem(at: Store.mediaDir.appendingPathComponent(item.localName))
             return
         }
-        for (id, task) in sessionTasks where task.originalRequest?.url == item.remoteURL {
-            task.cancel()
-            sessionTasks[id] = nil
+        session.getAllTasks { tasks in
+            for task in tasks where task.taskIdentifier == item.taskID {
+                task.cancel()
+            }
         }
         item.statusText = "已取消"
         item.isFailed = true
@@ -133,27 +129,34 @@ final class DownloadCenter: NSObject, ObservableObject {
         guard let linkID = linkID else { return }
         Store.shared.attach(localFile: name, to: linkID)
     }
+
+    fileprivate func item(forTask id: Int) -> DownloadItem? {
+        items.first { $0.taskID == id }
+    }
 }
 
 // MARK: - 后台下载回调
 
 extension DownloadCenter: URLSessionDownloadDelegate {
-    nonisolated func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64,
-                                totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
+    nonisolated func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                               didWriteData bytesWritten: Int64,
+                               totalBytesWritten: Int64,
+                               totalBytesExpectedToWrite: Int64) {
         let identifier = downloadTask.taskIdentifier
         let written = totalBytesWritten
         let expected = totalBytesExpectedToWrite
         Task { @MainActor in
             guard let item = DownloadCenter.shared.item(forTask: identifier) else { return }
-            if expected > 0 {
-                item.progress = Double(written) / Double(expected)
-            }
+            if expected > 0 { item.progress = Double(written) / Double(expected) }
             item.statusText = "下载中 \(Int(item.progress * 100))%"
-            item.detail = String(format: "%.1f / %.1f MB", Double(written) / 1_048_576, Double(max(expected, 0)) / 1_048_576)
+            item.detail = String(format: "%.1f / %.1f MB",
+                                 Double(written) / 1_048_576,
+                                 Double(max(expected, 0)) / 1_048_576)
         }
     }
 
-    nonisolated func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
+    nonisolated func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                               didFinishDownloadingTo location: URL) {
         let identifier = downloadTask.taskIdentifier
         Task { @MainActor in
             guard let item = DownloadCenter.shared.item(forTask: identifier) else { return }
@@ -179,7 +182,10 @@ extension DownloadCenter: URLSessionDownloadDelegate {
         let identifier = task.taskIdentifier
         let message = error.localizedDescription
         Task { @MainActor in
-            DownloadCenter.shared.markFailed(taskID: identifier, message: message)
+            guard let item = DownloadCenter.shared.item(forTask: identifier), !item.isFinished else { return }
+            item.isFailed = true
+            item.statusText = "失败"
+            item.detail = message
         }
     }
 
@@ -188,24 +194,6 @@ extension DownloadCenter: URLSessionDownloadDelegate {
             DownloadCenter.shared.backgroundCompletion?()
             DownloadCenter.shared.backgroundCompletion = nil
         }
-    }
-}
-
-extension DownloadCenter {
-    func item(forTask id: Int) -> DownloadItem? {
-        items.first { sessionTasks[$0.id] == nil && false }
-            ?? items.first { item in
-                sessionTasks.contains { $0.key == id && $0.value.originalRequest?.url == item.remoteURL }
-            }
-    }
-
-    func markFailed(taskID: Int, message: String) {
-        guard let item = item(forTask: taskID) else { return }
-        if item.isFinished { return }
-        item.isFailed = true
-        item.statusText = "失败"
-        item.detail = message
-        sessionTasks[taskID] = nil
     }
 }
 
@@ -224,8 +212,7 @@ enum M3U8Downloader {
         }
 
         if body.contains("#EXT-X-KEY") {
-            let lines = body.split(separator: "\n")
-            for line in lines where line.contains("METHOD=") {
+            for line in body.split(separator: "\n") where line.contains("METHOD=") {
                 if !line.contains("METHOD=NONE") { throw TransferError.encrypted }
             }
         }
@@ -262,7 +249,8 @@ enum M3U8Downloader {
     private static func fetchText(_ url: URL) async throws -> String {
         var req = URLRequest(url: url)
         req.timeoutInterval = 20
-        req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15", forHTTPHeaderField: "User-Agent")
+        req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15",
+                     forHTTPHeaderField: "User-Agent")
         let (data, _) = try await URLSession.shared.data(for: req)
         guard let text = String(data: data, encoding: .utf8) else { throw TransferError.badPlaylist }
         return text
