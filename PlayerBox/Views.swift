@@ -101,6 +101,12 @@ struct LinksView: View {
             .task(id: store.state.links.count) {
                 thumbs.ensureRemote(store.state.links)
             }
+            .onChange(of: settings.value.previewPercent) { _, _ in
+                thumbs.ensureRemote(store.state.links)
+            }
+            .onChange(of: settings.value.preferEmbeddedCover) { _, _ in
+                thumbs.ensureRemote(store.state.links)
+            }
             .sheet(isPresented: $showAdd) { AddLinkView(store: store) }
             .fullScreenCover(item: $playing) { target in
                 PlayerScreen(target: target)
@@ -315,7 +321,6 @@ struct PlayerScreen: View {
     @State private var previewTask: Task<Void, Never>? = nil
     @State private var previewRequested: Double = -1
 
-    /// 滑动灵敏度：整屏宽度对应秒数
     private let seekSecondsPerScreen: Double = 300
 
     var body: some View {
@@ -344,6 +349,15 @@ struct PlayerScreen: View {
                 }
             }
 
+            if dragMode == .seek && !useWeb {
+                VStack {
+                    Spacer()
+                    seekPreview
+                        .padding(.bottom, 168)
+                }
+                .allowsHitTesting(false)
+            }
+
             if controlsVisible {
                 VStack(spacing: 0) {
                     topBar
@@ -351,7 +365,6 @@ struct PlayerScreen: View {
                     if !errorText.isEmpty { errorBanner }
                     bottomBar
                 }
-                .transition(.opacity)
             }
 
             if controlsLocked {
@@ -360,7 +373,7 @@ struct PlayerScreen: View {
                     HStack {
                         Button {
                             controlsLocked = false
-                            withAnimation { controlsVisible = true }
+                            controlsVisible = true
                         } label: {
                             Image(systemName: "lock.fill")
                                 .font(.system(size: 15))
@@ -420,6 +433,9 @@ struct PlayerScreen: View {
             )
         }
         .ignoresSafeArea()
+        .transaction { transaction in
+            transaction.animation = nil
+        }
     }
 
     private var tapGesture: some Gesture {
@@ -429,7 +445,7 @@ struct PlayerScreen: View {
         }
         .exclusively(before: TapGesture(count: 1).onEnded {
             guard settings.value.singleTapToggle, !controlsLocked else { return }
-            withAnimation(.easeInOut(duration: 0.22)) { controlsVisible.toggle() }
+            controlsVisible.toggle()
         })
     }
 
@@ -441,10 +457,9 @@ struct PlayerScreen: View {
 
             if abs(dx) > abs(dy) {
                 guard settings.value.swipeSeek else { return }
-                withAnimation(.easeOut(duration: 0.12)) { dragMode = .seek }
+                dragMode = .seek
                 dragStartSeconds = displayCurrent
                 dragSeekTarget = displayCurrent
-                previewImage = nil
                 previewRequested = -1
                 requestPreview(at: displayCurrent)
             } else if value.startLocation.x <= size.width / 2 {
@@ -464,7 +479,7 @@ struct PlayerScreen: View {
             let maxTime = displayDuration > 0 ? displayDuration : max(dragStartSeconds + 3600, 1)
             let next = min(max(dragStartSeconds + delta, 0), maxTime)
             dragSeekTarget = next
-            if abs(next - previewRequested) > 0.8 {
+            if abs(next - previewRequested) > 0.5 {
                 previewRequested = next
                 requestPreview(at: next)
             }
@@ -486,10 +501,7 @@ struct PlayerScreen: View {
         if dragMode == .seek {
             seek(dragSeekTarget)
             previewTask?.cancel()
-            withAnimation(.easeOut(duration: 0.2)) {
-                dragMode = .none
-                previewImage = nil
-            }
+            dragMode = .none
         } else {
             dragMode = .none
         }
@@ -499,15 +511,31 @@ struct PlayerScreen: View {
         guard let generator = previewGenerator else { return }
         previewTask?.cancel()
         previewTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 120_000_000)
+            try? await Task.sleep(nanoseconds: 60_000_000)
             guard !Task.isCancelled else { return }
             let time = CMTime(seconds: max(0, seconds), preferredTimescale: 600)
-            guard let cg = try? await generator.image(at: time).image else { return }
-            guard !Task.isCancelled else { return }
-            withAnimation(.easeOut(duration: 0.1)) {
+            if let cg = try? await generator.image(at: time).image {
+                guard !Task.isCancelled else { return }
                 previewImage = UIImage(cgImage: cg)
+            } else if previewImage == nil {
+                previewImage = cachedSourceImage()
             }
         }
+    }
+
+    private func cachedSourceImage() -> UIImage? {
+        let percent = settings.value.previewPercent
+        let cover = settings.value.preferEmbeddedCover
+
+        if let name = target.direct?.lastPathComponent {
+            let key = ThumbnailStore.key(forLocal: name, percent: percent, preferCover: cover)
+            if let image = ThumbnailCenter.shared.image(key: key) { return image }
+        }
+        if let remote = target.remote?.absoluteString {
+            let key = ThumbnailStore.key(forRemote: remote, percent: percent, preferCover: cover)
+            if let image = ThumbnailCenter.shared.image(key: key) { return image }
+        }
+        return nil
     }
 
     // MARK: 顶部
@@ -599,11 +627,6 @@ struct PlayerScreen: View {
 
     private var bottomBar: some View {
         VStack(spacing: 8) {
-            if dragMode == .seek {
-                seekPreview
-                    .transition(.opacity.combined(with: .move(edge: .bottom)))
-            }
-
             HStack(spacing: 26) {
                 Spacer()
                 Button { toggleMute() } label: {
@@ -652,7 +675,7 @@ struct PlayerScreen: View {
             HStack {
                 Button {
                     controlsLocked = true
-                    withAnimation { controlsVisible = false }
+                    controlsVisible = false
                 } label: {
                     Image(systemName: "lock.open")
                         .font(.system(size: 18))
@@ -866,11 +889,11 @@ struct PlayerScreen: View {
             return
         }
 
-        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
+        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true]))
         generator.appliesPreferredTrackTransform = true
         generator.maximumSize = CGSize(width: 320, height: 180)
-        generator.requestedTimeToleranceBefore = CMTime(seconds: 2, preferredTimescale: 600)
-        generator.requestedTimeToleranceAfter = CMTime(seconds: 2, preferredTimescale: 600)
+        generator.requestedTimeToleranceBefore = CMTime(seconds: 1, preferredTimescale: 600)
+        generator.requestedTimeToleranceAfter = CMTime(seconds: 1, preferredTimescale: 600)
         previewGenerator = generator
 
         let mode = settings.value.engineMode
@@ -1178,6 +1201,12 @@ struct FilesView: View {
             .navigationTitle(navTitle(files))
             .scrollIndicators(settings.value.showScrollIndicators ? .visible : .hidden)
             .task(id: files.count) { thumbs.ensureLocal(files) }
+            .onChange(of: settings.value.previewPercent) { _, _ in
+                thumbs.ensureLocal(files)
+            }
+            .onChange(of: settings.value.preferEmbeddedCover) { _, _ in
+                thumbs.ensureLocal(files)
+            }
             .fullScreenCover(item: $playTarget) { target in
                 PlayerScreen(target: target)
             }
