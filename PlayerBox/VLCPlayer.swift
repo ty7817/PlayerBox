@@ -9,6 +9,8 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     @Published var isPlaying = false
     @Published var stateText = ""
     @Published var currentText = "00:00"
+    @Published var currentSeconds: Double = 0
+    @Published var durationSeconds: Double = 0
 
     override init() {
         super.init()
@@ -28,6 +30,7 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
 
     func play() { player.play() }
     func pause() { player.pause() }
+
     func toggle() {
         if isPlaying { pause() } else { play() }
     }
@@ -36,6 +39,11 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         var target = Int32(player.time.intValue) + Int32(seconds * 1000)
         if target < 0 { target = 0 }
         player.time = VLCTime(int: target)
+    }
+
+    func seek(toSeconds seconds: Double) {
+        let ms = Int32(max(0, seconds) * 1000)
+        player.time = VLCTime(int: ms)
     }
 
     func setRate(_ value: Float) {
@@ -66,7 +74,11 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     }
 
     func mediaPlayerTimeChanged(_ aNotification: Notification) {
+        let ms = Double(player.time.intValue)
+        currentSeconds = max(0, ms / 1000)
         currentText = format(Int(player.time.intValue))
+        let length = Double(player.media.length.intValue)
+        if length > 0 { durationSeconds = length / 1000 }
     }
 
     private func format(_ milliseconds: Int) -> String {

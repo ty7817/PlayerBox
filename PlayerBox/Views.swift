@@ -239,13 +239,47 @@ struct PlayTarget: Identifiable {
     let kind: LinkKind
 }
 
+// MARK: - 播放器画面（无系统控制条）
+
+final class PlayerLayerUIView: UIView {
+    override class var layerClass: AnyClass { AVPlayerLayer.self }
+    var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = .black
+        playerLayer.videoGravity = .resizeAspect
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+}
+
+struct PlayerLayerView: UIViewRepresentable {
+    let player: AVPlayer
+
+    func makeUIView(context: Context) -> PlayerLayerUIView {
+        let view = PlayerLayerUIView()
+        view.playerLayer.player = player
+        return view
+    }
+
+    func updateUIView(_ uiView: PlayerLayerUIView, context: Context) {
+        uiView.playerLayer.player = player
+    }
+}
+
 // MARK: - 播放页
+
+final class PlayerUIBus: ObservableObject {
+    var scrubbing = false
+}
 
 struct PlayerScreen: View {
     let target: PlayTarget
     @Environment(\.dismiss) private var dismiss
 
     @StateObject private var vlc = VLCController()
+    @StateObject private var bus = PlayerUIBus()
     @ObservedObject private var settings = SettingsStore.shared
 
     @State private var player: AVPlayer? = nil
@@ -256,23 +290,80 @@ struct PlayerScreen: View {
     @State private var speed: Float = 1
     @State private var isMuted = false
     @State private var isLooping = false
-    @State private var showShare = false
     @State private var toast = ""
+    @State private var current: Double = 0
+    @State private var duration: Double = 0
+    @State private var scrubValue: Double = 0
+    @State private var timeObserver: Any? = nil
     @State private var cancellable: AnyCancellable? = nil
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            content
-            overlay
-        }
-        .contentShape(Rectangle())
-        .simultaneousGesture(
-            TapGesture(count: 2).onEnded {
-                if settings.value.doubleTapToggle { togglePlayback() }
+
+            videoArea
+
+            if isBuffering {
+                VStack(spacing: 10) {
+                    ProgressView().tint(.white).scaleEffect(1.2)
+                    Text("缓冲中…").font(.caption).foregroundStyle(.white.opacity(0.8))
+                }
             }
-        )
-        .simultaneousGesture(
+
+            if useVLC && !vlc.stateText.isEmpty {
+                VStack(spacing: 10) {
+                    ProgressView().tint(.white).scaleEffect(1.2)
+                    Text(vlc.stateText).font(.caption).foregroundStyle(.white.opacity(0.8))
+                }
+            }
+
+            VStack(spacing: 0) {
+                topBar
+                Spacer()
+                if !errorText.isEmpty { errorBanner }
+                bottomBar
+            }
+            .padding(.top, 6)
+
+            if !toast.isEmpty {
+                Text(toast)
+                    .font(.caption)
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 12).padding(.vertical, 6)
+                    .background(.black.opacity(0.65), in: Capsule())
+                    .frame(maxHeight: .infinity, alignment: .bottom)
+                    .padding(.bottom, 190)
+            }
+        }
+        .onAppear { prepare() }
+        .onDisappear { teardown() }
+        .onReceive(NotificationCenter.default.publisher(for: .AVPlayerItemDidPlayToEndTime)) { _ in
+            guard isLooping, let player = player else { return }
+            player.seek(to: .zero)
+            player.play()
+        }
+    }
+
+    // MARK: 画面
+
+    private var videoArea: some View {
+        Group {
+            if useWeb {
+                WebView(urlString: target.remote?.absoluteString ?? "")
+            } else if useVLC {
+                VLCVideoSurface(player: vlc.player)
+            } else if let player = player {
+                PlayerLayerView(player: player)
+            } else {
+                Color.black
+            }
+        }
+        .ignoresSafeArea()
+        .contentShape(Rectangle())
+        .onTapGesture(count: 2) {
+            if settings.value.doubleTapToggle { togglePlayback() }
+        }
+        .gesture(
             DragGesture(minimumDistance: 40).onEnded { value in
                 guard settings.value.swipeSeek else { return }
                 let dx = value.translation.width
@@ -282,175 +373,235 @@ struct PlayerScreen: View {
                 flash(dx > 0 ? "快进 15 秒" : "快退 15 秒")
             }
         )
-        .onAppear { prepare() }
-        .onDisappear {
-            player?.pause()
-            vlc.pause()
-            UIApplication.shared.isIdleTimerDisabled = false
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .AVPlayerItemDidPlayToEndTime)) { _ in
-            guard isLooping, let player = player else { return }
-            player.seek(to: .zero)
-            player.play()
-        }
-        .sheet(isPresented: $showShare) {
-            ShareSheet(items: shareItems)
-        }
     }
 
-    @ViewBuilder
-    private var content: some View {
-        if useWeb {
-            WebView(urlString: target.remote?.absoluteString ?? "")
-                .ignoresSafeArea()
-        } else if useVLC {
-            VLCVideoSurface(player: vlc.player)
-                .ignoresSafeArea()
-        } else if let player = player {
-            VideoPlayer(player: player)
-                .ignoresSafeArea()
-        } else {
-            ProgressView()
-                .tint(.white)
-                .scaleEffect(1.3)
-        }
-    }
+    // MARK: 顶部
 
-    private var overlay: some View {
-        VStack(spacing: 8) {
-            HStack(spacing: 10) {
-                Button {
-                    player?.pause()
-                    vlc.pause()
-                    dismiss()
-                } label: {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 15, weight: .bold))
-                        .padding(10)
-                        .background(.ultraThinMaterial, in: Circle())
-                }
-                Spacer()
-                if let file = target.direct {
-                    ShareLink(item: file) {
-                        Image(systemName: "square.and.arrow.up")
-                            .font(.system(size: 15, weight: .bold))
-                            .padding(10)
-                            .background(.ultraThinMaterial, in: Circle())
-                    }
-                }
-                if !errorText.isEmpty && !useWeb {
-                    Button(useVLC ? "用网页播" : "用 VLC 内核") {
-                        if useVLC { switchToWeb() } else { switchToVLC() }
-                    }
-                    .font(.caption)
-                    .padding(.horizontal, 12).padding(.vertical, 8)
-                    .background(.ultraThinMaterial, in: Capsule())
-                }
-            }
-            .padding(.horizontal, 16)
-            .padding(.top, 8)
-
-            if useVLC && !vlc.stateText.isEmpty {
-                Text(vlc.stateText)
-                    .font(.caption)
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 12).padding(.vertical, 6)
-                    .background(.black.opacity(0.45), in: Capsule())
-            }
-
-            if !useVLC && !isReady && player != nil && !useWeb {
-                Text("缓冲中…")
-                    .font(.caption)
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 12).padding(.vertical, 6)
-                    .background(.black.opacity(0.45), in: Capsule())
-            }
-
-            if !errorText.isEmpty {
-                Text(errorText)
-                    .font(.caption)
-                    .foregroundStyle(.white)
-                    .multilineTextAlignment(.leading)
-                    .padding(10)
-                    .background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 10))
-                    .padding(.horizontal, 16)
-            }
-
-            Spacer()
-
-            if (player != nil || useVLC) && !useWeb {
-                actionBar
-            }
-
-            if !toast.isEmpty {
-                Text(toast)
-                    .font(.caption)
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 12).padding(.vertical, 6)
-                    .background(.black.opacity(0.6), in: Capsule())
-                    .padding(.bottom, 8)
-            }
-        }
-    }
-
-    private var actionBar: some View {
+    private var topBar: some View {
         HStack(spacing: 12) {
-            if useVLC {
-                Button { vlc.toggle() } label: {
-                    pill(vlc.isPlaying ? "暂停" : "播放", icon: vlc.isPlaying ? "pause.fill" : "play.fill")
+            Button { closePlayer() } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .frame(width: 34, height: 34)
+                    .contentShape(Rectangle())
+            }
+
+            Text(displayTitle)
+                .font(.caption)
+                .foregroundStyle(.white.opacity(0.85))
+                .lineLimit(1)
+                .truncationMode(.middle)
+
+            Spacer(minLength: 8)
+
+            if let file = target.direct {
+                ShareLink(item: file) {
+                    topIcon("square.and.arrow.up")
+                }
+            } else if let remote = target.remote {
+                ShareLink(item: remote) {
+                    topIcon("square.and.arrow.up")
                 }
             }
 
             Menu {
                 ForEach([0.5, 0.75, 1.0, 1.25, 1.5, 2.0], id: \.self) { value in
-                    Button {
-                        setSpeed(Float(value))
-                    } label: {
-                        Text(speedText(Float(value)))
-                    }
+                    Button(speedText(Float(value))) { setSpeed(Float(value)) }
                 }
             } label: {
-                pill(speedText(speed), icon: "speedometer")
-            }
-
-            Button { jump(-15) } label: { pill("-15s", icon: "gobackward.15") }
-            Button { jump(15) } label: { pill("+15s", icon: "goforward.15") }
-
-            if !useVLC {
-                Button { toggleMute() } label: {
-                    pill(isMuted ? "静音" : "有声", icon: isMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
-                }
+                Text(speedText(speed))
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .frame(width: 34, height: 34)
+                    .background(.white.opacity(0.14), in: Circle())
             }
 
             Menu {
                 Toggle("循环播放", isOn: $isLooping)
                 Button("复制链接") { copyLink() }
-                Button("分享 / 用外部播放器打开") { showShare = true }
+                Button("截图保存到本地") { captureScreenshot() }
+                if !errorText.isEmpty && !useWeb {
+                    if useVLC {
+                        Button("用网页播") { switchToWeb() }
+                    } else if target.kind != .page {
+                        Button("用 VLC 内核") { switchToVLC() }
+                    }
+                }
             } label: {
-                pill("更多", icon: "ellipsis")
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .frame(width: 34, height: 34)
+                    .contentShape(Rectangle())
             }
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 9)
-        .background(.ultraThinMaterial, in: Capsule())
-        .padding(.bottom, 18)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 6)
+        .background(
+            LinearGradient(colors: [.black.opacity(0.55), .black.opacity(0.0)],
+                           startPoint: .top, endPoint: .bottom)
+            .ignoresSafeArea(edges: .top)
+        )
     }
 
-    private func pill(_ text: String, icon: String) -> some View {
-        HStack(spacing: 4) {
-            Image(systemName: icon).font(.system(size: 12, weight: .semibold))
-            Text(text).font(.system(size: 12, weight: .semibold))
+    private func topIcon(_ name: String) -> some View {
+        Image(systemName: name)
+            .font(.system(size: 15, weight: .semibold))
+            .foregroundStyle(.white)
+            .frame(width: 34, height: 34)
+            .contentShape(Rectangle())
+    }
+
+    // MARK: 底部
+
+    private var bottomBar: some View {
+        VStack(spacing: 10) {
+            HStack(spacing: 10) {
+                Text(timeText(displayCurrent))
+                    .font(.system(size: 12, weight: .medium).monospacedDigit())
+                    .foregroundStyle(.white)
+
+                Slider(value: Binding(
+                    get: { bus.scrubbing ? scrubValue : displayCurrent },
+                    set: { scrubValue = $0 }
+                ), in: 0...max(displayDuration, 1), onEditingChanged: { editing in
+                    if editing {
+                        scrubValue = displayCurrent
+                        bus.scrubbing = true
+                    } else {
+                        bus.scrubbing = false
+                        seek(scrubValue)
+                    }
+                })
+                .tint(.white)
+
+                Text(timeText(displayDuration))
+                    .font(.system(size: 12, weight: .medium).monospacedDigit())
+                    .foregroundStyle(.white)
+            }
+
+            HStack(spacing: 42) {
+                Button { jump(-15) } label: {
+                    VStack(spacing: 2) {
+                        Image(systemName: "gobackward.15").font(.system(size: 19))
+                        Text("-15s").font(.system(size: 9))
+                    }
+                    .foregroundStyle(.white)
+                    .frame(width: 52, height: 44)
+                    .contentShape(Rectangle())
+                }
+
+                Button { togglePlayback() } label: {
+                    Image(systemName: playingIcon)
+                        .font(.system(size: 30, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .frame(width: 64, height: 64)
+                        .contentShape(Rectangle())
+                }
+
+                Button { jump(15) } label: {
+                    VStack(spacing: 2) {
+                        Image(systemName: "goforward.15").font(.system(size: 19))
+                        Text("+15s").font(.system(size: 9))
+                    }
+                    .foregroundStyle(.white)
+                    .frame(width: 52, height: 44)
+                    .contentShape(Rectangle())
+                }
+            }
+
+            HStack(spacing: 22) {
+                Button { toggleMute() } label: {
+                    bottomLabel(isMuted ? "静音" : "有声", icon: isMuted ? "speaker.slash" : "speaker.wave.2")
+                }
+                .disabled(useVLC)
+                .opacity(useVLC ? 0.3 : 1)
+
+                Button { isLooping.toggle() } label: {
+                    bottomLabel(isLooping ? "循环开" : "循环关", icon: "repeat")
+                }
+
+                Button { jump(-30) } label: {
+                    bottomLabel("退 30s", icon: "backward.end")
+                }
+
+                Button { jump(30) } label: {
+                    bottomLabel("进 30s", icon: "forward.end")
+                }
+            }
+            .padding(.bottom, 4)
         }
-        .padding(.horizontal, 8).padding(.vertical, 6)
-        .foregroundStyle(.white)
-        .background(Color.white.opacity(0.12), in: Capsule())
+        .padding(.horizontal, 18)
+        .padding(.top, 14)
+        .padding(.bottom, 20)
+        .background(
+            LinearGradient(colors: [.black.opacity(0.0), .black.opacity(0.62)],
+                           startPoint: .top, endPoint: .bottom)
+            .ignoresSafeArea(edges: .bottom)
+        )
     }
 
-    private var shareItems: [Any] {
-        if let file = target.direct { return [file] }
-        if let remote = target.remote { return [remote] }
-        return []
+    private func bottomLabel(_ text: String, icon: String) -> some View {
+        VStack(spacing: 3) {
+            Image(systemName: icon).font(.system(size: 15))
+            Text(text).font(.system(size: 9))
+        }
+        .foregroundStyle(.white.opacity(0.78))
+        .frame(minWidth: 44, minHeight: 40)
+        .contentShape(Rectangle())
     }
+
+    private var errorBanner: some View {
+        Text(errorText)
+            .font(.caption)
+            .foregroundStyle(.white)
+            .multilineTextAlignment(.leading)
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 10))
+            .padding(.horizontal, 16)
+            .padding(.bottom, 8)
+    }
+
+    // MARK: 状态
+
+    private var displayTitle: String {
+        if !target.title.isEmpty { return target.title }
+        if let remote = target.remote { return remote.lastPathComponent }
+        if let direct = target.direct { return direct.lastPathComponent }
+        return "播放"
+    }
+
+    private var displayCurrent: Double { useVLC ? vlc.currentSeconds : current }
+    private var displayDuration: Double { useVLC ? vlc.durationSeconds : duration }
+
+    private var playingIcon: String {
+        if useVLC { return vlc.isPlaying ? "pause.fill" : "play.fill" }
+        return player?.timeControlStatus == .playing ? "pause.fill" : "play.fill"
+    }
+
+    private var isBuffering: Bool {
+        guard !useWeb, !useVLC, player != nil, errorText.isEmpty else { return false }
+        return !isReady
+    }
+
+    private func timeText(_ seconds: Double) -> String {
+        guard seconds.isFinite, seconds > 0 else { return "00:00" }
+        let total = Int(seconds)
+        let h = total / 3600
+        let m = (total % 3600) / 60
+        let s = total % 60
+        if h > 0 { return String(format: "%d:%02d:%02d", h, m, s) }
+        return String(format: "%02d:%02d", m, s)
+    }
+
+    private func speedText(_ value: Float) -> String {
+        if value == Float(Int(value)) { return "\(Int(value))x" }
+        return String(format: "%.2fx", value)
+    }
+
+    // MARK: 生命周期
 
     private func prepare() {
         speed = Float(settings.value.defaultSpeed)
@@ -461,7 +612,7 @@ struct PlayerScreen: View {
             UIApplication.shared.isIdleTimerDisabled = true
         }
 
-        if target.kind == .page && target.direct == nil {
+        if target.kind == .page && target.direct == nil && target.remote != nil {
             useWeb = true
             return
         }
@@ -492,18 +643,50 @@ struct PlayerScreen: View {
         player = newPlayer
         newPlayer.play()
 
+        timeObserver = newPlayer.addPeriodicTimeObserver(
+            forInterval: CMTime(seconds: 0.4, preferredTimescale: 600),
+            queue: .main
+        ) { time in
+            guard !bus.scrubbing else { return }
+            let seconds = CMTimeGetSeconds(time)
+            if seconds.isFinite, seconds >= 0 { current = seconds }
+        }
+
         cancellable = item.publisher(for: \.status)
             .receive(on: DispatchQueue.main)
             .sink { status in
                 switch status {
                 case .readyToPlay:
                     isReady = true
+                    Task { @MainActor in
+                        if let loaded = try? await item.asset.load(.duration) {
+                            let seconds = CMTimeGetSeconds(loaded)
+                            if seconds.isFinite, seconds > 0 { duration = seconds }
+                        }
+                    }
                 case .failed:
-                    errorText = item.error?.localizedDescription ?? "播放失败：可能是格式不受支持或链接已失效"
+                    errorText = item.error?.localizedDescription ?? "播放失败：可能格式不受支持或链接已失效"
                 default:
                     break
                 }
             }
+    }
+
+    private func teardown() {
+        if let observer = timeObserver, let player = player {
+            player.removeTimeObserver(observer)
+        }
+        timeObserver = nil
+        cancellable = nil
+        player?.pause()
+        player = nil
+        vlc.pause()
+        UIApplication.shared.isIdleTimerDisabled = false
+    }
+
+    private func closePlayer() {
+        teardown()
+        dismiss()
     }
 
     private func startVLC(_ url: URL) {
@@ -530,10 +713,7 @@ struct PlayerScreen: View {
     }
 
     private func togglePlayback() {
-        if useVLC {
-            vlc.toggle()
-            return
-        }
+        if useVLC { vlc.toggle(); return }
         guard let player = player else { return }
         if player.timeControlStatus == .playing {
             player.pause()
@@ -552,12 +732,15 @@ struct PlayerScreen: View {
         }
     }
 
-    private func jump(_ seconds: Double) {
-        if useVLC { vlc.jump(seconds); return }
+    private func seek(_ seconds: Double) {
+        if useVLC { vlc.seek(toSeconds: seconds); return }
         guard let player = player else { return }
-        var target = CMTimeAdd(player.currentTime(), CMTime(seconds: seconds, preferredTimescale: 600))
-        if CMTimeCompare(target, .zero) < 0 { target = .zero }
-        player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
+        player.seek(to: CMTime(seconds: max(0, seconds), preferredTimescale: 600),
+                    toleranceBefore: .zero, toleranceAfter: .zero)
+    }
+
+    private func jump(_ seconds: Double) {
+        seek(displayCurrent + seconds)
     }
 
     private func toggleMute() {
@@ -571,6 +754,33 @@ struct PlayerScreen: View {
         flash("链接已复制")
     }
 
+    private func captureScreenshot() {
+        guard let url = target.direct ?? target.remote else {
+            flash("截图失败：没有可用地址")
+            return
+        }
+        let seconds = max(0, displayCurrent)
+        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
+        generator.appliesPreferredTrackTransform = true
+        generator.requestedTimeToleranceBefore = CMTime(seconds: 1, preferredTimescale: 600)
+        generator.requestedTimeToleranceAfter = CMTime(seconds: 1, preferredTimescale: 600)
+        Task { @MainActor in
+            guard let cg = try? await generator.image(at: CMTime(seconds: seconds, preferredTimescale: 600)).image,
+                  let data = UIImage(cgImage: cg).jpegData(compressionQuality: 0.9) else {
+                flash("截图失败：当前画面无法提取")
+                return
+            }
+            let name = "shot-\(Int(Date().timeIntervalSince1970)).jpg"
+            let url = Store.mediaDir.appendingPathComponent(name)
+            do {
+                try data.write(to: url, options: .atomic)
+                flash("截图已保存到「本地文件」")
+            } catch {
+                flash("截图保存失败")
+            }
+        }
+    }
+
     private func flash(_ text: String) {
         toast = text
         Task { @MainActor in
@@ -579,19 +789,12 @@ struct PlayerScreen: View {
         }
     }
 
-    private func speedText(_ value: Float) -> String {
-        if value == Float(Int(value)) { return "\(Int(value))x" }
-        return String(format: "%.2fx", value)
-    }
-
     private func activateAudioSession() {
         let session = AVAudioSession.sharedInstance()
         let quiet = !settings.value.backgroundAudio
         try? session.setCategory(quiet ? .ambient : .playback, mode: .moviePlayback, options: [])
         try? session.setActive(true)
     }
-
-    private func speedLabel(_ value: Float) -> String { speedText(value) }
 }
 
 struct ShareSheet: UIViewControllerRepresentable {
