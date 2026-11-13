@@ -196,6 +196,9 @@ final class ThumbnailCenter: ObservableObject {
 
     private var running: Set<String> = []
     private var memory: [String: UIImage] = [:]
+    private var pending: [() -> Void] = []
+    private var active = 0
+    private let maxConcurrent = 3
 
     func image(key: String) -> UIImage? {
         if let cached = memory[key] { return cached }
@@ -217,14 +220,16 @@ final class ThumbnailCenter: ObservableObject {
             let urlString = link.url
             let localName = link.localFile
             let isPage = link.kind == .page
-            Task { @MainActor in
-                _ = await ThumbnailStore.generateRemote(urlString: urlString,
-                                                       localName: localName,
-                                                       isPage: isPage,
-                                                       key: key,
-                                                       percent: percent,
-                                                       preferCover: preferCover)
-                self.finish(key: key)
+            enqueue {
+                Task { @MainActor in
+                    _ = await ThumbnailStore.generateRemote(urlString: urlString,
+                                                           localName: localName,
+                                                           isPage: isPage,
+                                                           key: key,
+                                                           percent: percent,
+                                                           preferCover: preferCover)
+                    self.finish(key: key)
+                }
             }
         }
     }
@@ -238,20 +243,37 @@ final class ThumbnailCenter: ObservableObject {
             guard image(key: key) == nil, !running.contains(key) else { continue }
             running.insert(key)
             let name = file.name
-            Task { @MainActor in
-                _ = await ThumbnailStore.generateLocal(name: name, key: key,
-                                                       percent: percent, preferCover: preferCover)
-                self.finish(key: key)
+            enqueue {
+                Task { @MainActor in
+                    _ = await ThumbnailStore.generateLocal(name: name, key: key,
+                                                           percent: percent, preferCover: preferCover)
+                    self.finish(key: key)
+                }
             }
         }
     }
 
+    private func enqueue(_ start: @escaping () -> Void) {
+        pending.append(start)
+        drain()
+    }
+
+    private func drain() {
+        while active < maxConcurrent, !pending.isEmpty {
+            let start = pending.removeFirst()
+            active += 1
+            start()
+        }
+    }
+
     private func finish(key: String) {
+        active = max(0, active - 1)
         running.remove(key)
         if let loaded = ThumbnailStore.cachedImage(key: key) {
             memory[key] = loaded
         }
         version += 1
+        drain()
     }
 
     func refresh(key: String) {
@@ -262,6 +284,8 @@ final class ThumbnailCenter: ObservableObject {
     func clearCache() {
         memory.removeAll()
         running.removeAll()
+        pending.removeAll()
+        active = 0
         version += 1
     }
 }

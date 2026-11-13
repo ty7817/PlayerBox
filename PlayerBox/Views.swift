@@ -244,7 +244,7 @@ struct PlayTarget: Identifiable {
     let kind: LinkKind
 }
 
-// MARK: - 播放器画面（无系统控制条）
+// MARK: - 播放器画面
 
 final class PlayerLayerUIView: UIView {
     override class var layerClass: AnyClass { AVPlayerLayer.self }
@@ -270,6 +270,7 @@ struct PlayerLayerView: UIViewRepresentable {
 
     func updateUIView(_ uiView: PlayerLayerUIView, context: Context) {
         uiView.playerLayer.player = player
+        uiView.playerLayer.videoGravity = .resizeAspect
     }
 }
 
@@ -309,7 +310,12 @@ struct PlayerScreen: View {
     @State private var dragStartValue: Float = 0
     @State private var dragSeekTarget: Double = 0
 
-    /// 滑动灵敏度：整屏宽度对应的秒数（越大越灵敏）
+    @State private var previewImage: UIImage? = nil
+    @State private var previewGenerator: AVAssetImageGenerator? = nil
+    @State private var previewTask: Task<Void, Never>? = nil
+    @State private var previewRequested: Double = -1
+
+    /// 滑动灵敏度：整屏宽度对应秒数
     private let seekSecondsPerScreen: Double = 300
 
     var body: some View {
@@ -318,22 +324,23 @@ struct PlayerScreen: View {
 
             videoArea
 
-            if isBuffering {
-                VStack(spacing: 12) {
-                    ProgressView()
-                        .progressViewStyle(.circular)
-                        .tint(.white)
-                        .scaleEffect(1.5)
-                    Text("缓冲中…")
-                        .font(.system(size: 12))
-                        .foregroundStyle(.white.opacity(0.75))
-                }
+            if showStartupSpinner {
+                ProgressView()
+                    .progressViewStyle(.circular)
+                    .tint(.white)
+                    .scaleEffect(1.4)
             }
 
-            if useVLC && !vlc.stateText.isEmpty {
-                VStack(spacing: 12) {
-                    ProgressView().tint(.white).scaleEffect(1.5)
-                    Text(vlc.stateText).font(.system(size: 12)).foregroundStyle(.white.opacity(0.75))
+            if useVLC && vlc.stateText.contains("失败") {
+                VStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(.system(size: 22))
+                        .foregroundStyle(.white.opacity(0.8))
+                    Text(vlc.stateText)
+                        .font(.system(size: 12))
+                        .foregroundStyle(.white.opacity(0.8))
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 40)
                 }
             }
 
@@ -407,7 +414,7 @@ struct PlayerScreen: View {
             .contentShape(Rectangle())
             .simultaneousGesture(tapGesture)
             .gesture(
-                DragGesture(minimumDistance: 12)
+                DragGesture(minimumDistance: 10)
                     .onChanged { value in handleDragChanged(value, size: geo.size) }
                     .onEnded { value in handleDragEnded(value) }
             )
@@ -430,13 +437,16 @@ struct PlayerScreen: View {
         if dragMode == .none {
             let dx = value.translation.width
             let dy = value.translation.height
-            guard max(abs(dx), abs(dy)) > 12 else { return }
+            guard max(abs(dx), abs(dy)) > 10 else { return }
 
             if abs(dx) > abs(dy) {
                 guard settings.value.swipeSeek else { return }
-                dragMode = .seek
+                withAnimation(.easeOut(duration: 0.12)) { dragMode = .seek }
                 dragStartSeconds = displayCurrent
                 dragSeekTarget = displayCurrent
+                previewImage = nil
+                previewRequested = -1
+                requestPreview(at: displayCurrent)
             } else if value.startLocation.x <= size.width / 2 {
                 guard settings.value.brightnessSwipe else { return }
                 dragMode = .brightness
@@ -452,7 +462,12 @@ struct PlayerScreen: View {
         case .seek:
             let delta = Double(value.translation.width / max(size.width, 1)) * seekSecondsPerScreen
             let maxTime = displayDuration > 0 ? displayDuration : max(dragStartSeconds + 3600, 1)
-            dragSeekTarget = min(max(dragStartSeconds + delta, 0), maxTime)
+            let next = min(max(dragStartSeconds + delta, 0), maxTime)
+            dragSeekTarget = next
+            if abs(next - previewRequested) > 0.8 {
+                previewRequested = next
+                requestPreview(at: next)
+            }
 
         case .brightness:
             let level = min(max(dragStartValue + Float(-value.translation.height / max(size.height, 1)), 0), 1)
@@ -470,8 +485,29 @@ struct PlayerScreen: View {
     private func handleDragEnded(_ value: DragGesture.Value) {
         if dragMode == .seek {
             seek(dragSeekTarget)
+            previewTask?.cancel()
+            withAnimation(.easeOut(duration: 0.2)) {
+                dragMode = .none
+                previewImage = nil
+            }
+        } else {
+            dragMode = .none
         }
-        dragMode = .none
+    }
+
+    private func requestPreview(at seconds: Double) {
+        guard let generator = previewGenerator else { return }
+        previewTask?.cancel()
+        previewTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 120_000_000)
+            guard !Task.isCancelled else { return }
+            let time = CMTime(seconds: max(0, seconds), preferredTimescale: 600)
+            guard let cg = try? await generator.image(at: time).image else { return }
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeOut(duration: 0.1)) {
+                previewImage = UIImage(cgImage: cg)
+            }
+        }
     }
 
     // MARK: 顶部
@@ -480,7 +516,7 @@ struct PlayerScreen: View {
         HStack(spacing: 24) {
             Button { closePlayer() } label: {
                 Image(systemName: "xmark")
-                    .font(.system(size: 22, weight: .regular))
+                    .font(.system(size: 22))
                     .foregroundStyle(.white)
                     .frame(width: 34, height: 34)
                     .contentShape(Rectangle())
@@ -562,7 +598,12 @@ struct PlayerScreen: View {
     // MARK: 底部
 
     private var bottomBar: some View {
-        VStack(spacing: 6) {
+        VStack(spacing: 8) {
+            if dragMode == .seek {
+                seekPreview
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
+            }
+
             HStack(spacing: 26) {
                 Spacer()
                 Button { toggleMute() } label: {
@@ -595,24 +636,12 @@ struct PlayerScreen: View {
             }
 
             HStack(spacing: 10) {
-                Text(timeText(displayCurrent))
+                Text(timeText(barValue))
                     .font(.system(size: 13).monospacedDigit())
                     .foregroundStyle(.white)
                     .frame(width: 52, alignment: .leading)
 
-                Slider(value: Binding(
-                    get: { bus.scrubbing ? scrubValue : displayCurrent },
-                    set: { scrubValue = $0 }
-                ), in: 0...max(displayDuration, 1), onEditingChanged: { editing in
-                    if editing {
-                        scrubValue = displayCurrent
-                        bus.scrubbing = true
-                    } else {
-                        bus.scrubbing = false
-                        seek(scrubValue)
-                    }
-                })
-                .tint(.white)
+                progressBar
 
                 Text(timeText(displayDuration))
                     .font(.system(size: 13).monospacedDigit())
@@ -694,6 +723,73 @@ struct PlayerScreen: View {
         )
     }
 
+    private var progressBar: some View {
+        GeometryReader { geo in
+            let progress = displayDuration > 0 ? min(max(barValue / displayDuration, 0), 1) : 0
+            let seeking = dragMode == .seek
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(Color.white.opacity(seeking ? 0.35 : 0.22))
+                    .frame(height: seeking ? 5 : 3)
+                    .frame(maxHeight: .infinity, alignment: .center)
+
+                Capsule()
+                    .fill(Color.white)
+                    .frame(width: max(0, geo.size.width * progress), height: seeking ? 5 : 3)
+                    .frame(maxHeight: .infinity, alignment: .center)
+
+                Circle()
+                    .fill(Color.white)
+                    .frame(width: seeking ? 13 : 8, height: seeking ? 13 : 8)
+                    .shadow(color: .black.opacity(0.35), radius: 2, y: 1)
+                    .offset(x: geo.size.width * progress - (seeking ? 6.5 : 4))
+                    .frame(maxHeight: .infinity, alignment: .center)
+            }
+            .animation(.easeOut(duration: 0.16), value: seeking)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0, coordinateSpace: .local)
+                    .onChanged { value in
+                        bus.scrubbing = true
+                        let ratio = min(max(value.location.x / max(geo.size.width, 1), 0), 1)
+                        scrubValue = Double(ratio) * max(displayDuration, 1)
+                    }
+                    .onEnded { _ in
+                        bus.scrubbing = false
+                        seek(scrubValue)
+                    }
+            )
+        }
+        .frame(height: 22)
+    }
+
+    private var seekPreview: some View {
+        VStack(spacing: 6) {
+            if let image = previewImage {
+                Image(uiImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .frame(width: 172, height: 97)
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+            } else {
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(Color.black.opacity(0.5))
+                    .frame(width: 172, height: 97)
+                    .overlay(
+                        Image(systemName: "photo")
+                            .font(.system(size: 18))
+                            .foregroundStyle(.white.opacity(0.35))
+                    )
+            }
+
+            Text(timeText(dragSeekTarget))
+                .font(.system(size: 12, weight: .medium).monospacedDigit())
+                .foregroundStyle(.white)
+        }
+        .padding(8)
+        .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 10))
+    }
+
     private var errorBanner: some View {
         Text(errorText)
             .font(.caption)
@@ -715,6 +811,11 @@ struct PlayerScreen: View {
         return "播放"
     }
 
+    private var barValue: Double {
+        if dragMode == .seek { return dragSeekTarget }
+        return bus.scrubbing ? scrubValue : displayCurrent
+    }
+
     private var displayCurrent: Double { useVLC ? vlc.currentSeconds : current }
     private var displayDuration: Double { useVLC ? vlc.durationSeconds : duration }
 
@@ -723,7 +824,7 @@ struct PlayerScreen: View {
         return player?.timeControlStatus == .playing ? "pause.fill" : "play.fill"
     }
 
-    private var isBuffering: Bool {
+    private var showStartupSpinner: Bool {
         guard !useWeb, !useVLC, player != nil, errorText.isEmpty else { return false }
         return !isReady
     }
@@ -765,6 +866,13 @@ struct PlayerScreen: View {
             return
         }
 
+        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: 320, height: 180)
+        generator.requestedTimeToleranceBefore = CMTime(seconds: 2, preferredTimescale: 600)
+        generator.requestedTimeToleranceAfter = CMTime(seconds: 2, preferredTimescale: 600)
+        previewGenerator = generator
+
         let mode = settings.value.engineMode
         let ext = url.pathExtension.lowercased()
 
@@ -787,10 +895,10 @@ struct PlayerScreen: View {
         newPlayer.play()
 
         timeObserver = newPlayer.addPeriodicTimeObserver(
-            forInterval: CMTime(seconds: 0.4, preferredTimescale: 600),
+            forInterval: CMTime(seconds: 0.3, preferredTimescale: 600),
             queue: .main
         ) { time in
-            guard !bus.scrubbing else { return }
+            guard !bus.scrubbing, dragMode != .seek else { return }
             let seconds = CMTimeGetSeconds(time)
             if seconds.isFinite, seconds >= 0 { current = seconds }
         }
@@ -821,6 +929,7 @@ struct PlayerScreen: View {
         }
         timeObserver = nil
         cancellable = nil
+        previewTask?.cancel()
         player?.pause()
         player = nil
         vlc.pause()
