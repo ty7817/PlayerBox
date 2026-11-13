@@ -223,7 +223,7 @@ struct PlayerScreen: View {
             }
 
             VStack {
-                HStack {
+                HStack(spacing: 10) {
                     Button {
                         player?.pause()
                         dismiss()
@@ -234,8 +234,17 @@ struct PlayerScreen: View {
                             .background(.ultraThinMaterial, in: Circle())
                     }
                     Spacer()
-                    if !errorText.isEmpty {
+                    if let file = target.direct {
+                        ShareLink(item: file) {
+                            Image(systemName: "square.and.arrow.up")
+                                .font(.system(size: 15, weight: .bold))
+                                .padding(10)
+                                .background(.ultraThinMaterial, in: Circle())
+                        }
+                    }
+                    if !errorText.isEmpty && !useWeb {
                         Button("用网页播") {
+                            player?.pause()
                             useWeb = true
                             errorText = ""
                         }
@@ -251,6 +260,7 @@ struct PlayerScreen: View {
                     Text(errorText)
                         .font(.caption)
                         .foregroundStyle(.white)
+                        .multilineTextAlignment(.leading)
                         .padding(10)
                         .background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 10))
                         .padding(.horizontal, 16)
@@ -260,7 +270,6 @@ struct PlayerScreen: View {
         }
         .onAppear { prepare() }
         .onDisappear { player?.pause() }
-        .statusBarHidden(false)
     }
 
     private func prepare() {
@@ -276,9 +285,9 @@ struct PlayerScreen: View {
             return
         }
 
-        let ext = (url.pathExtension).lowercased()
+        let ext = url.pathExtension.lowercased()
         if target.kind == .file, !ext.isEmpty, !LinkDetector.nativePlayable(ext) {
-            errorText = "内置解码器不支持 .\(ext) 格式，请下载后用支持该格式的播放器打开"
+            errorText = "内置播放器不支持 .\(ext)。点右上角分享按钮，可用 VLC / nPlayer / Infuse 打开"
             return
         }
 
@@ -291,7 +300,7 @@ struct PlayerScreen: View {
             .receive(on: DispatchQueue.main)
             .sink { status in
                 if status == .failed {
-                    errorText = item.error?.localizedDescription ?? "播放失败，可能是格式不支持或链接失效"
+                    errorText = item.error?.localizedDescription ?? "播放失败：可能是格式不受支持或链接已失效"
                 }
             }
     }
@@ -379,7 +388,7 @@ struct FilesView: View {
                 let files = store.files()
                 if files.isEmpty {
                     ContentUnavailableView("暂无文件", systemImage: "folder",
-                                           description: Text("下载完成的视频会出现在这里"))
+                                           description: Text("下载完成的视频会出现在这里；也会同步到「文件」App"))
                 }
                 ForEach(files) { file in
                     Button {

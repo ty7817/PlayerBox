@@ -47,6 +47,8 @@ targets:
           NSAllowsArbitraryLoadsInWebContent: true
         UIBackgroundModes:
           - audio
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
         ITSAppUsesNonExemptEncryption: false
     settings:
       base:
