@@ -95,9 +95,8 @@ enum ThumbnailStore {
         guard let imageURL = await ogImageURL(from: url) else { return nil }
         var request = URLRequest(url: imageURL)
         request.timeoutInterval = 12
-        if let host = imageURL.host, url.host != nil {
-            request.setValue("https://\(url.host!)/", forHTTPHeaderField: "Referer")
-            _ = host
+        if let host = url.host {
+            request.setValue("https://\(host)/", forHTTPHeaderField: "Referer")
         }
         guard let (data, _) = try? await URLSession.shared.data(for: request),
               let image = UIImage(data: data) else { return nil }
@@ -125,13 +124,13 @@ enum ThumbnailStore {
 
     private static func attribute(_ name: String, in text: String) -> String? {
         guard let range = text.range(of: name + "=", options: .caseInsensitive) else { return nil }
-        var rest = text[range.upperBound...]
+        var rest = String(text[range.upperBound...])
         rest = rest.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let first = rest.first else { return nil }
         if first == "\"" || first == "'" {
             rest.removeFirst()
             guard let end = rest.firstIndex(of: first) else { return nil }
-            let value = String(rest[..<end]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let value = rest[..<end].trimmingCharacters(in: .whitespacesAndNewlines)
             return value.isEmpty ? nil : value
         }
         let value = String(rest.prefix { !$0.isWhitespace && $0 != ">" })
